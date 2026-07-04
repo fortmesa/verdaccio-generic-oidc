@@ -1,0 +1,40 @@
+services:
+  verdaccio:
+    build:
+      # Repo root, not this directory -- packages/server is a yarn workspace
+      # member, and the Dockerfile needs the whole workspace's manifests
+      # (root package.json + yarn.lock + every member's package.json) to
+      # resolve correctly via `yarn workspaces focus`. See Dockerfile.
+      context: ../..
+      dockerfile: packages/server/Dockerfile
+    ports:
+      - '127.0.0.1:4873:4873'
+    volumes:
+      - ./config.yaml:/verdaccio/conf/config.yaml
+    depends_on:
+      - redis
+      - keycloak
+
+  redis:
+    image: redis:5
+    volumes:
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf
+    command:
+      - redis-server
+      - /usr/local/etc/redis/redis.conf
+
+  # Local OIDC provider for manual/dev testing. Realm/client/roles are
+  # pre-provisioned from keycloak/realm-export.json on startup; the test user
+  # ("alice" / "alicepw", holding the npm-publish realm role and the admin
+  # client role) is created by keycloak/bootstrap-test-user.sh, since
+  # Keycloak's realm import does not carry user credentials.
+  keycloak:
+    image: quay.io/keycloak/keycloak:latest
+    command: start-dev --import-realm
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    ports:
+      - '127.0.0.1:18080:8080'
+    volumes:
+      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json

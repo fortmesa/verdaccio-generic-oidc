@@ -1,0 +1,150 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-slim
+    steps:
+      - uses: actions/checkout@v4
+
+      # ubuntu-slim already ships a Node version well within our floor
+      # (^20.19.0 || >=22.12.0, from the vitest/rolldown requirement -- see
+      # .nvmrc), so pinning an exact version here is unneeded overhead.
+      # Re-enable this if a future bump (e.g. Node 26) needs a version
+      # newer than whatever ubuntu-slim currently bundles.
+      # - uses: actions/setup-node@v4
+      #   with:
+      #     node-version-file: .nvmrc
+
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Build server plugin
+        run: yarn workspace @fortmesa/verdaccio-generic-oidc build
+
+      - name: Test server plugin
+        run: yarn workspace @fortmesa/verdaccio-generic-oidc test
+
+      - name: Build yarn plugin
+        run: yarn workspace @fortmesa/yarn-plugin-oidc-login build
+
+  release:
+    name: Create release
+    needs: test
+    runs-on: ubuntu-slim
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # ubuntu-slim already ships a Node version well within our floor
+      # (^20.19.0 || >=22.12.0, from the vitest/rolldown requirement -- see
+      # .nvmrc), so pinning an exact version here is unneeded overhead.
+      # Re-enable this if a future bump (e.g. Node 26) needs a version
+      # newer than whatever ubuntu-slim currently bundles.
+      # - uses: actions/setup-node@v4
+      #   with:
+      #     node-version-file: .nvmrc
+
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Build server plugin
+        run: yarn workspace @fortmesa/verdaccio-generic-oidc build
+
+      - name: Build yarn plugin
+        run: yarn workspace @fortmesa/yarn-plugin-oidc-login build
+
+      - name: Assemble release assets
+        run: |
+          set -eu
+          mkdir -p dist
+          cp packages/yarn-plugin-oidc-login/bundles/@yarnpkg/plugin-oidc-login.js dist/plugin-oidc-login.cjs
+          cp install.sh dist/install.sh
+          # Same tarball publish-npm uploads to npmjs.dev.fort.blue, attached
+          # here too so it can be inspected/downloaded without registry
+          # access, and outlives that registry's own retention policy.
+          yarn workspace @fortmesa/verdaccio-generic-oidc pack -o "dist/verdaccio-generic-oidc-${{ github.ref_name }}.tgz"
+
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum * > checksums.txt
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
+  publish-npm:
+    name: Publish npm package
+    needs: test
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # See the `test` job above for why setup-node is skipped.
+      # - uses: actions/setup-node@v4
+      #   with:
+      #     node-version-file: .nvmrc
+
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Build server plugin
+        run: yarn workspace @fortmesa/verdaccio-generic-oidc build
+
+      # This registry (npmjs.dev.fort.blue) runs verdaccio-oidc-auth, which
+      # verifies a GitHub Actions OIDC token directly as a bearer credential
+      # -- no OAuth exchange, no browser, unrelated to this repo's own
+      # verdaccio-generic-oidc plugin (see docs/yarn-integration.md's web-login
+      # handshake, which is a different, human-facing flow). The registry's
+      # `github-actions` trusted-issuer config (fm-npmjs's k8s/02-configmap.yaml)
+      # must have this exact repo in its `allow` list, and the audience below
+      # must match its configured `audience` exactly, or this 401s.
+      - name: Get OIDC token for npmjs.dev.fort.blue
+        id: oidc
+        run: |
+          set -eu
+          TOKEN=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://npmjs.dev.fort.blue" \
+            | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>console.log(JSON.parse(d).value))')
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      # Scoped to this job's ephemeral checkout only -- never written to the
+      # repo's own committed .yarnrc.yml, since the actual publish registry
+      # for @fortmesa/* is deliberately not baked into package.json/.yarnrc.yml
+      # (a separate, later step adds public npmjs publishing for the same
+      # package, which will need a different registry target).
+      - name: Configure npm registry for @fortmesa scope
+        env:
+          NPM_TOKEN: ${{ steps.oidc.outputs.token }}
+        run: |
+          set -eu
+          yarn config set 'npmScopes.fortmesa.npmRegistryServer' 'https://npmjs.dev.fort.blue'
+          yarn config set 'npmScopes.fortmesa.npmAlwaysAuth' true
+          yarn config set 'npmScopes.fortmesa.npmAuthToken' "$NPM_TOKEN"
+
+      - name: Publish to npmjs.dev.fort.blue
+        run:
+          yarn workspace @fortmesa/verdaccio-generic-oidc npm publish --access
+          public

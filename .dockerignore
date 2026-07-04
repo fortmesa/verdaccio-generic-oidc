@@ -1,0 +1,10 @@
+**
+
+!package.json
+!yarn.lock
+!.yarnrc.yml
+!packages/server/package.json
+!packages/server/tsconfig.json
+!packages/server/src
+!packages/server/src/**
+!packages/yarn-plugin-oidc-login/package.json

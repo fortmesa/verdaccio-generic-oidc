@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "target": "es2020",
+    "lib": ["es2020"],
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "outDir": "lib",
+    "sourceMap": true,
+    "declaration": true,
+    "strict": true,
+    "noImplicitReturns": true,
+    "noUnusedLocals": true,
+    // Without this, tsc's default ambient-@types discovery walks every
+    // ancestor node_modules/@types it can find -- under the yarn workspace's
+    // shared, hoisted node_modules, that includes unrelated sibling
+    // packages' own dependencies (e.g. @types/emscripten, pulled in by
+    // yarn-plugin-oidc-login's @yarnpkg/* devDependencies via
+    // @yarnpkg/libzip). Everything this package actually imports (express,
+    // ioredis, jsonwebtoken, etc.) resolves its own types through normal
+    // module resolution regardless of this setting -- only ambient/global
+    // type providers like @types/node need to be listed here.
+    "types": ["node"]
+  },
+  "files": ["src/index.ts"],
+  "include": ["src/**/*.d.ts"]
+}

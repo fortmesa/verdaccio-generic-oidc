@@ -1,0 +1,26 @@
+{
+  "name": "verdaccio-generic-oidc-monorepo",
+  "private": true,
+  "license": "MIT",
+  "workspaces": [
+    "packages/*"
+  ],
+  "packageManager": "yarn@4.17.0",
+  "scripts": {
+    "prepare": "husky"
+  },
+  "lint-staged": {
+    "**/*.{ts,js,yml,yaml,json,md}": [
+      "prettier --write"
+    ]
+  },
+  "devDependencies": {
+    "@aws-sdk/client-dynamodb": "^3.1014.0",
+    "@aws-sdk/lib-dynamodb": "^3.1014.0",
+    "generic-pool": "^3.7.1",
+    "husky": "^9.1.7",
+    "ioredis": "^5.4.1",
+    "lint-staged": "^17.0.8",
+    "prettier": "^3.3.3"
+  }
+}

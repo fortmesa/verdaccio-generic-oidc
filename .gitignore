@@ -1,0 +1,12 @@
+node_modules/
+lib/
+bundles/
+dist/
+*.log
+.DS_Store
+
+# Yarn Berry: local install optimization state, not reproducible source of
+# truth -- yarn.lock is what's committed. No .yarn/cache/ or .pnp.* since
+# nodeLinker is node-modules, not the default Plug'n'Play.
+.yarn/install-state.gz
+.pnp.*
