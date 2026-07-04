@@ -305,7 +305,19 @@ export default class OidcPlugin
         const roles = this.getRoles(tokenSet);
         cb(null, [username, ...roles]);
       })
-      .catch(err => cb(err, false));
+      .catch(err => {
+        // cb(err, ...) aborts Verdaccio's entire auth plugin chain outright
+        // (see @verdaccio/auth's authenticate()) -- it never falls through
+        // to htpasswd, defeating the break-glass fallback this plugin is
+        // deliberately configured ahead of. Falling through to the next
+        // auth plugin is the expected, by-design outcome of this plugin
+        // not authenticating the request, regardless of why.
+        plugin.logger.debug(
+          {err},
+          'oidc: error while authenticating: @{!err.message}\n@{err.stack} -- falling through to any other configured auth plugin',
+        );
+        cb(null, false);
+      });
   }
 
   public apiJWTmiddleware?: (helpers: any) => any;

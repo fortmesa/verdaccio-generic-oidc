@@ -533,6 +533,29 @@ describe('OidcPlugin: authenticate()', () => {
     plugin.close();
   });
 
+  it('falls through to the next auth plugin (does not abort the chain) when session storage throws', async () => {
+    const {plugin, logger} = createPlugin();
+    (plugin as any).ss.get = () => {
+      throw new Error('simulated DynamoDB failure');
+    };
+
+    const result = await new Promise<[unknown, unknown]>(resolve => {
+      plugin.authenticate('alice', 'irrelevant-password', (err, groups) =>
+        resolve([err, groups]),
+      );
+    });
+    // err must be null -- @verdaccio/auth's real plugin chain aborts
+    // entirely (never tries htpasswd) if err is truthy here, regardless of
+    // what the second argument is.
+    expect(result[0]).toBeNull();
+    expect(result[1]).toBe(false);
+    expect(logger.debug).toHaveBeenCalledWith(
+      expect.objectContaining({err: expect.any(Error)}),
+      expect.stringContaining('falling through'),
+    );
+    plugin.close();
+  });
+
   it('rejects when the username does not match the session', async () => {
     const {plugin, config} = createPlugin();
     const server = await startServer(plugin, config, makeAuth());
