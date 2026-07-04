@@ -4,14 +4,18 @@ import {extractGroups, GroupsLogger} from './groups';
 function makeLogger(): GroupsLogger & {
   warnCalls: unknown[][];
   infoCalls: unknown[][];
+  debugCalls: unknown[][];
 } {
   const warnCalls: unknown[][] = [];
   const infoCalls: unknown[][] = [];
+  const debugCalls: unknown[][] = [];
   return {
     warnCalls,
     infoCalls,
+    debugCalls,
     warn: vi.fn((...args: unknown[]) => warnCalls.push(args)),
     info: vi.fn((...args: unknown[]) => infoCalls.push(args)),
+    debug: vi.fn((...args: unknown[]) => debugCalls.push(args)),
   };
 }
 
@@ -180,7 +184,7 @@ describe('extractGroups: roles.allowList filtering (native map form)', () => {
 });
 
 describe('extractGroups: unsatisfiable filter against a flat (membership-only) claim', () => {
-  it('excludes the group and warns, rather than silently matching', () => {
+  it('excludes the group and logs, rather than silently matching', () => {
     const logger = makeLogger();
     const claims = {roles: ['team1', 'team2']};
     const opts = {
@@ -188,10 +192,10 @@ describe('extractGroups: unsatisfiable filter against a flat (membership-only) c
     };
     const result = extractGroups(claims, opts, logger);
     expect(result).not.toContain('team1');
-    expect(logger.warnCalls).toHaveLength(1);
+    expect(logger.debugCalls).toHaveLength(1);
   });
 
-  it('does not warn for a group with an empty (but present) role dimension', () => {
+  it('does not log for a group with an empty (but present) role dimension', () => {
     const logger = makeLogger();
     const claims = {resource_access: {team2: {roles: []}}};
     const opts = {
@@ -199,6 +203,6 @@ describe('extractGroups: unsatisfiable filter against a flat (membership-only) c
     };
     const result = extractGroups(claims, opts, logger);
     expect(result).not.toContain('team2'); // empty roles never intersects a non-empty filter
-    expect(logger.warnCalls).toHaveLength(0); // but this isn't a config mistake, so no warning
+    expect(logger.debugCalls).toHaveLength(0); // but this isn't a config mistake, so no log
   });
 });

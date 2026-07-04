@@ -578,3 +578,76 @@ describe('OidcPlugin: invalid login request ids', () => {
     }
   });
 });
+
+describe('OidcPlugin: apiJWTmiddleware() bearer token handling', () => {
+  function makeReq(headers: Record<string, string>) {
+    return {headers, pause() {}, resume() {}} as any;
+  }
+  function makeHelpers() {
+    return {
+      createAnonymousRemoteUser: () => ({
+        name: undefined,
+        groups: [],
+        real_groups: [],
+      }),
+    };
+  }
+
+  it('a bearer token with a foreign iss claim is skipped quietly, not logged as an error', () => {
+    const {plugin, logger} = createPlugin();
+    const handler = (plugin as any).apiJWTmiddleware(makeHelpers());
+    const foreignToken = jwt.sign(
+      {iss: 'https://token.actions.githubusercontent.com', sub: 'x'},
+      'irrelevant-secret',
+    );
+    const req = makeReq({authorization: `Bearer ${foreignToken}`});
+    let nextCalledWithError: Error | undefined | 'not-called' = 'not-called';
+    handler(req, {}, (err?: Error) => {
+      nextCalledWithError = err;
+    });
+
+    expect(nextCalledWithError).toBeUndefined();
+    expect(logger.error).not.toHaveBeenCalled();
+    expect(logger.debug).toHaveBeenCalledWith(
+      expect.objectContaining({
+        iss: 'https://token.actions.githubusercontent.com',
+      }),
+      expect.stringContaining('not one of ours'),
+    );
+  });
+
+  it('a token with no iss claim that fails verification still logs at error (a real problem worth seeing)', () => {
+    const {plugin, logger} = createPlugin();
+    const handler = (plugin as any).apiJWTmiddleware(makeHelpers());
+    // No `iss` claim, signed with the wrong secret -- this is the shape a
+    // genuinely broken token (tampered, wrong secret after rotation) would
+    // have, as opposed to a foreign token that was never meant for this
+    // plugin at all.
+    const noIssToken = jwt.sign({sub: 'x'}, 'wrong-secret');
+    const req = makeReq({authorization: `Bearer ${noIssToken}`});
+    // The next() wrapper always calls the real _next() with no arguments,
+    // regardless of whether an internal error occurred (see its own
+    // comments) -- the actual signal that verification failed is
+    // req.remote_user.error, set inside the wrapper itself.
+    handler(req, {}, () => {});
+
+    expect((req.remote_user as {error?: string}).error).toBe(
+      'unable to verify jwt bearer token',
+    );
+    expect(logger.error).toHaveBeenCalled();
+  });
+
+  it('a garbage (non-JWT) bearer token does not crash and still logs at error', () => {
+    const {plugin, logger} = createPlugin();
+    const handler = (plugin as any).apiJWTmiddleware(makeHelpers());
+    const req = makeReq({authorization: 'Bearer garbage.not.a.jwt'});
+    expect(() => {
+      handler(req, {}, () => {});
+    }).not.toThrow();
+
+    expect((req.remote_user as {error?: string}).error).toBe(
+      'unable to verify jwt bearer token',
+    );
+    expect(logger.error).toHaveBeenCalled();
+  });
+});

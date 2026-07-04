@@ -190,7 +190,7 @@ export default class OidcPlugin
       forever: true,
       maxTimeout: 30_000,
       onRetry: (err, attempt) => {
-        this.logger.error(
+        this.logger.warn(
           {err, attempt},
           'Failed to discover issuer, retrying [@{attempt}]: @{!err.message}\n@{err.stack}',
         );
@@ -290,7 +290,7 @@ export default class OidcPlugin
           return;
         }
         if (tokenSet.expired()) {
-          plugin.logger.info(
+          plugin.logger.debug(
             {username},
             'Refreshing expired session for @{username}',
           );
@@ -359,6 +359,27 @@ export default class OidcPlugin
 
       const jwtRaw = authorizationParts[1];
       let jwtPayload = undefined;
+
+      // signPayload() below never sets an `iss` claim on a token this plugin
+      // itself issues -- only a foreign token (e.g. a CI provider's OIDC
+      // token, meant for a completely different auth plugin like
+      // verdaccio-oidc-auth) would have one. Decoding first (no signature
+      // check, cannot throw -- jwt.decode() returns null on anything
+      // malformed) and skipping straight past anything with an `iss` avoids
+      // logging a guaranteed, expected verification failure as an @{error}
+      // -- error-level logging exists to flag a real problem to resolve,
+      // not routine traffic this plugin was never going to authenticate in
+      // the first place. A real failure to verify one of *this plugin's
+      // own* tokens (expired, tampered, wrong secret) still logs at error
+      // below, since that case is actually worth investigating.
+      const decoded = jwt.decode(jwtRaw) as {iss?: string} | null;
+      if (decoded?.iss) {
+        plugin.logger.debug(
+          {iss: decoded.iss},
+          'bearer token has issuer @{iss} -- not one of ours, skipping',
+        );
+        return next();
+      }
 
       try {
         jwtPayload = jwt.verify(jwtRaw, plugin.options.config.secret);

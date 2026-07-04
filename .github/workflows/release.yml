@@ -10,7 +10,7 @@ jobs:
     name: Test
     runs-on: ubuntu-slim
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # ubuntu-slim already ships a Node version well within our floor
       # (^20.19.0 || >=22.12.0, from the vitest/rolldown requirement -- see
@@ -43,7 +43,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # ubuntu-slim already ships a Node version well within our floor
       # (^20.19.0 || >=22.12.0, from the vitest/rolldown requirement -- see
@@ -96,7 +96,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # See the `test` job above for why setup-node is skipped.
       # - uses: actions/setup-node@v4
@@ -141,6 +141,7 @@ jobs:
         run: |
           set -eu
           yarn config set 'npmScopes.fortmesa.npmRegistryServer' 'https://npmjs.dev.fort.blue'
+          yarn config set 'npmScopes.fortmesa.npmPublishRegistry' 'https://npmjs.dev.fort.blue'
           yarn config set 'npmScopes.fortmesa.npmAlwaysAuth' true
           yarn config set 'npmScopes.fortmesa.npmAuthToken' "$NPM_TOKEN"
 

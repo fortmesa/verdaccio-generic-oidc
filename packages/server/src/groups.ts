@@ -34,6 +34,7 @@ export interface GroupsConfig {
 export interface GroupsLogger {
   info(obj: unknown, msg?: string): void;
   warn(obj: unknown, msg?: string): void;
+  debug(obj: unknown, msg?: string): void;
 }
 
 /** roles === null means "membership only" -- the claim shape carries no per-role info to filter on. */
@@ -167,7 +168,7 @@ export function extractGroups(
     }
 
     if (roles == null) {
-      logger.warn(
+      logger.debug(
         {group: name, rolesClaim},
         `roles.allowList configures a role filter for group '@{group}', but the claim at '@{rolesClaim}' carries no per-role information for it (membership only) -- this filter can never match and will always exclude the group. Remove the role list to include it unconditionally, or configure the IdP to emit per-role data for this claim.`,
       );
