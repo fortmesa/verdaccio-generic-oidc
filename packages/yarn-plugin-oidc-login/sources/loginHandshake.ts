@@ -19,8 +19,21 @@ const DEFAULT_POLL_INTERVAL_MS = 2000;
 
 // Keyed by registry: dedupes concurrent callers (a cold `yarn install` fires
 // many requests in parallel) so only one handshake -- and one browser tab --
-// happens at a time, regardless of how many requests are waiting on it.
+// happens at a time, regardless of how many requests are waiting on it. This
+// only covers callers racing while a handshake is still pending -- it's
+// deleted once the handshake settles, so on its own it does NOT stop a
+// second, later call from starting a brand new handshake.
 const inFlight = new Map<string, Promise<string | undefined>>();
+
+// The actual fix for repeat logins within one process: persistToken() below
+// only writes to $HOME/.yarnrc.yml for *future* processes (see its own
+// comment) -- this process's own Configuration object, and the
+// currentHeader Yarn resolves from it, are never refreshed mid-run. Without
+// this cache, every single package fetch after the first would see no
+// header configured yet and no in-flight handshake to join, and would kick
+// off (and open a browser for) its own brand new handshake -- exactly the
+// "opens the browser for every fetch" bug this fixes.
+const tokenCache = new Map<string, string>();
 
 function isInteractive(): boolean {
   return Boolean(process.stdout.isTTY) && !process.env.CI;
@@ -28,11 +41,21 @@ function isInteractive(): boolean {
 
 async function persistToken(registry: string, token: string): Promise<void> {
   await Configuration.updateHomeConfiguration({
+    // Must stay a plain object, never a Map: Yarn's own YAML serializer
+    // (stringifySyml) silently drops this entire key when the value is a
+    // Map instance -- confirmed directly against the real serializer, not
+    // just theorized -- so a Map here means the token silently never gets
+    // written at all, while every sibling top-level key still saves fine.
+    // current is likewise always a plain object here (or undefined), never
+    // a real Map -- it comes straight from YAML parsing.
     npmRegistries: (current: unknown) => {
-      const map = new Map(current instanceof Map ? current : []);
-      const entry = (map.get(registry) as Record<string, unknown>) ?? {};
-      map.set(registry, {...entry, npmAuthToken: token});
-      return map;
+      const registries =
+        current && typeof current === 'object'
+          ? {...(current as Record<string, unknown>)}
+          : {};
+      const entry = (registries[registry] as Record<string, unknown>) ?? {};
+      registries[registry] = {...entry, npmAuthToken: token};
+      return registries;
     },
   });
 }
@@ -113,18 +136,19 @@ async function runHandshake(
  * and returns it directly so the CURRENT request can use it immediately --
  * updateHomeConfiguration only affects processes started after it returns.
  */
-export async function ensureLogin(
+function runDedupedHandshake(
   configuration: Configuration,
   registry: string,
 ): Promise<string | undefined> {
-  if (!isInteractive()) return undefined;
-
   const existing = inFlight.get(registry);
   if (existing) return existing;
 
   const promise = runHandshake(configuration, registry)
     .then(async token => {
-      if (token) await persistToken(registry, token);
+      if (token) {
+        tokenCache.set(registry, token);
+        await persistToken(registry, token);
+      }
       return token;
     })
     .finally(() => {
@@ -133,4 +157,36 @@ export async function ensureLogin(
 
   inFlight.set(registry, promise);
   return promise;
+}
+
+/**
+ * Used from getNpmAuthenticationHeader: no header configured at all yet.
+ * Reuses an already-obtained token for the rest of this process's lifetime
+ * -- see tokenCache's own comment for why that's required, not optional.
+ */
+export async function ensureLogin(
+  configuration: Configuration,
+  registry: string,
+): Promise<string | undefined> {
+  if (!isInteractive()) return undefined;
+
+  const cached = tokenCache.get(registry);
+  if (cached) return cached;
+
+  return runDedupedHandshake(configuration, registry);
+}
+
+/**
+ * Used from wrapNetworkRequest on a real 401: the cached token (if any) is
+ * the one that was just rejected, so it must be discarded before
+ * re-authenticating, unlike ensureLogin's normal reuse-what-we-have path.
+ */
+export async function refreshLogin(
+  configuration: Configuration,
+  registry: string,
+): Promise<string | undefined> {
+  if (!isInteractive()) return undefined;
+
+  tokenCache.delete(registry);
+  return runDedupedHandshake(configuration, registry);
 }

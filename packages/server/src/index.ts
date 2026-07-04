@@ -878,16 +878,19 @@ const callbackResponseHtml = (username: string, token: string) => `
       localStorage.setItem('username', ${JSON.stringify(username)});
       localStorage.setItem('token', ${JSON.stringify(token)});
     </script>
-    You are now authenticated in npm and on this website.
+    You are now authenticated in npm and on this website. You can close this
+    tab, or <a href="/">continue to the site</a>.
     <script>
-      // A CLI (npm/yarn --web-login) opens this page as a fresh, script-opened
-      // tab/popup, which window.close() is allowed to close; a human who
-      // navigated here directly via /-/oidc/start in an existing tab is not
-      // (browsers silently no-op close() there) -- redirect that case back to
-      // the registry's own homepage instead, now authenticated via the
-      // localStorage set above.
+      // Browsers only let a page close itself via window.close() when that
+      // exact window/tab was opened by a window.open() call from script --
+      // an OS-level browser launch (a CLI's own "open this URL" helper, e.g.
+      // yarn-plugin-oidc-login's use of it, same as a human navigating here
+      // directly) doesn't count, and window.close() silently no-ops. Still
+      // worth attempting since it costs nothing when it *does* apply, but
+      // the visible fallback above must not assume which case this is --
+      // an automatic redirect to the site is a false success signal for the
+      // CLI/browser-launch case, not just an occasional no-op.
       window.close();
-      setTimeout(function() { window.location.href = '/'; }, 300);
     </script>
   </body>
 </html>

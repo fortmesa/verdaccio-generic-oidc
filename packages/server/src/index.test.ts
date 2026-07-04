@@ -435,12 +435,16 @@ describe('OidcPlugin: GET /-/oidc/start', () => {
       expect(callbackRes.status).toBe(200);
       const callbackHtml = await callbackRes.text();
 
-      // Distinct from the CLI-triggered popup flow: still attempts
-      // window.close() first (harmless no-op in a non-script-opened tab),
-      // but falls back to redirecting home instead of leaving a dead end.
+      // Same response as the CLI-triggered flow: attempts window.close()
+      // (a harmless no-op here, since this tab wasn't opened via script),
+      // but must NOT auto-redirect -- that would be a false success signal
+      // for a CLI/browser-launch caller, which looks identical to this at
+      // the HTTP level. A visible, clickable link covers the human case
+      // instead of an assumption about which caller this is.
       expect(callbackHtml).toContain('alice');
       expect(callbackHtml).toContain('window.close()');
-      expect(callbackHtml).toContain("window.location.href = '/'");
+      expect(callbackHtml).not.toContain('window.location.href');
+      expect(callbackHtml).toContain('href="/"');
     } finally {
       await server.close();
       plugin.close();
