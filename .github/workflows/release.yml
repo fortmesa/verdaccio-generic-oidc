@@ -10,14 +10,14 @@ jobs:
     name: Test
     runs-on: ubuntu-slim
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # ubuntu-slim already ships a Node version well within our floor
       # (^20.19.0 || >=22.12.0, from the vitest/rolldown requirement -- see
       # .nvmrc), so pinning an exact version here is unneeded overhead.
       # Re-enable this if a future bump (e.g. Node 26) needs a version
       # newer than whatever ubuntu-slim currently bundles.
-      # - uses: actions/setup-node@v4
+      # - uses: actions/setup-node@v6
       #   with:
       #     node-version-file: .nvmrc
 
@@ -43,14 +43,14 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # ubuntu-slim already ships a Node version well within our floor
       # (^20.19.0 || >=22.12.0, from the vitest/rolldown requirement -- see
       # .nvmrc), so pinning an exact version here is unneeded overhead.
       # Re-enable this if a future bump (e.g. Node 26) needs a version
       # newer than whatever ubuntu-slim currently bundles.
-      # - uses: actions/setup-node@v4
+      # - uses: actions/setup-node@v6
       #   with:
       #     node-version-file: .nvmrc
 
@@ -82,7 +82,7 @@ jobs:
         run: sha256sum * > checksums.txt
 
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/*
           generate_release_notes: true
@@ -96,10 +96,10 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # See the `test` job above for why setup-node is skipped.
-      # - uses: actions/setup-node@v4
+      # - uses: actions/setup-node@v6
       #   with:
       #     node-version-file: .nvmrc
 
