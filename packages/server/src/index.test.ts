@@ -117,6 +117,17 @@ function startFakeIssuer(clientId: string): Promise<FakeIssuer> {
       let body = '';
       req.on('data', chunk => (body += chunk));
       req.on('end', () => {
+        // A real, non-OIDC credential (e.g. an htpasswd password) sent as a
+        // token-exchange subject_token must be rejected the way a real IdP
+        // would reject an access token it never issued -- this sentinel
+        // lets tests exercise that fallthrough path deliberately.
+        const params = new URLSearchParams(body);
+        if (params.get('subject_token') === 'not-an-oidc-token') {
+          res.statusCode = 400;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({error: 'invalid_grant'}));
+          return;
+        }
         res.setHeader('Content-Type', 'application/json');
         res.end(
           JSON.stringify({
@@ -498,6 +509,116 @@ describe('OidcPlugin: token-exchange endpoint (PUT /-/user/...)', () => {
       plugin.close();
     }
   });
+
+  describe('falling through to the configured auth chain when password is not an OIDC token', () => {
+    // This endpoint is also what plain `npm login`/`yarn login` call --
+    // reusing it (see the handler's own comments) means a real password
+    // (htpasswd, or any other sibling auth plugin) must fall through to the
+    // real, multi-plugin auth chain instead of being rejected outright.
+    function makeFallthroughAuth(
+      authenticateImpl: (
+        user: string,
+        password: string,
+        cb: (err: Error | null, user: unknown) => void,
+      ) => void,
+    ) {
+      return {
+        ...makeAuth(),
+        authenticate: vi.fn(authenticateImpl),
+        jwtEncrypt: vi.fn(async () => 'fallthrough-issued-token'),
+      } as any;
+    }
+
+    it('delegates to the auth chain and issues a token via its own jwtEncrypt on success', async () => {
+      const {plugin, config} = createPlugin();
+      const htpasswdUser = {
+        name: 'alice',
+        groups: ['alice', '$all', '$authenticated'],
+        real_groups: [],
+      };
+      const auth = makeFallthroughAuth((user, password, cb) =>
+        cb(null, htpasswdUser),
+      );
+      const server = await startServer(plugin, config, auth);
+      try {
+        const res = await fetch(
+          `${server.baseUrl}/-/user/org.couchdb.user:alice`,
+          {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+              name: 'alice',
+              password: 'not-an-oidc-token',
+            }),
+          },
+        );
+        expect(res.status).toBe(201);
+        expect(auth.authenticate).toHaveBeenCalledWith(
+          'alice',
+          'not-an-oidc-token',
+          expect.any(Function),
+        );
+        expect(auth.jwtEncrypt).toHaveBeenCalledWith(
+          htpasswdUser,
+          expect.anything(),
+        );
+        const body = await res.json();
+        expect(body.token).toBe('fallthrough-issued-token');
+      } finally {
+        await server.close();
+        plugin.close();
+      }
+    });
+
+    it('rejects with 401 when the auth chain does not recognize the credential', async () => {
+      const {plugin, config} = createPlugin();
+      const auth = makeFallthroughAuth((user, password, cb) => cb(null, false));
+      const server = await startServer(plugin, config, auth);
+      try {
+        const res = await fetch(
+          `${server.baseUrl}/-/user/org.couchdb.user:alice`,
+          {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+              name: 'alice',
+              password: 'not-an-oidc-token',
+            }),
+          },
+        );
+        expect(res.status).toBe(401);
+      } finally {
+        await server.close();
+        plugin.close();
+      }
+    });
+
+    it('propagates a real error from the auth chain instead of a clean 401', async () => {
+      const {plugin, config} = createPlugin();
+      const auth = makeFallthroughAuth((user, password, cb) =>
+        cb(new Error('storage unavailable'), false),
+      );
+      const server = await startServer(plugin, config, auth);
+      try {
+        const res = await fetch(
+          `${server.baseUrl}/-/user/org.couchdb.user:alice`,
+          {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+              name: 'alice',
+              password: 'not-an-oidc-token',
+            }),
+          },
+        );
+        expect(res.status).not.toBe(201);
+        expect(res.status).not.toBe(401);
+      } finally {
+        await server.close();
+        plugin.close();
+      }
+    });
+  });
 });
 
 describe('OidcPlugin: authenticate()', () => {
@@ -711,5 +832,121 @@ describe('OidcPlugin: apiJWTmiddleware() bearer token handling', () => {
 
     expect((req.remote_user as {error?: string}).error).toBeUndefined();
     expect(req.remote_user.name).toBe('alice');
+  });
+
+  it('a malformed authorization header (no scheme/credential split) is rejected, not delegated', () => {
+    const {plugin} = createPlugin();
+    const handler = (plugin as any).apiJWTmiddleware(makeHelpers());
+    const req = makeReq({authorization: 'garbage-no-space'});
+    handler(req, {}, () => {});
+
+    expect((req.remote_user as {error?: string}).error).toBe(
+      'malformed authorization header',
+    );
+  });
+
+  describe('Basic-Auth scheme delegation', () => {
+    // This plugin's apiJWTmiddleware entirely replaces Verdaccio's own
+    // (Verdaccio calls a plugin-provided one instead of its default, never
+    // both) -- without delegating Basic-Auth to the real, multi-plugin auth
+    // chain here, no sibling plugin configured alongside this one (htpasswd,
+    // or any other) could ever authenticate anything. Confirmed directly
+    // against a real deployment: removing this plugin restored htpasswd's
+    // own Basic-Auth login.
+    function basicAuthHeader(user: string, password: string): string {
+      return `Basic ${Buffer.from(`${user}:${password}`).toString('base64')}`;
+    }
+
+    it('delegates a Basic-Auth request to the real auth chain and adopts its remote_user on success', () => {
+      const {plugin} = createPlugin();
+      const authChainUser = {
+        name: 'htpasswd-user',
+        groups: ['htpasswd-user', '$all', '$authenticated'],
+        real_groups: [],
+      };
+      const authenticate = vi.fn((user, password, cb) =>
+        cb(null, authChainUser),
+      );
+      plugin.register_middlewares(express(), {authenticate} as any);
+      const handler = (plugin as any).apiJWTmiddleware(makeHelpers());
+      const req = makeReq({
+        authorization: basicAuthHeader('htpasswd-user', 'correct-password'),
+      });
+      let nextCalled = false;
+      handler(req, {}, () => {
+        nextCalled = true;
+      });
+
+      expect(authenticate).toHaveBeenCalledWith(
+        'htpasswd-user',
+        'correct-password',
+        expect.any(Function),
+      );
+      expect(nextCalled).toBe(true);
+      expect(req.remote_user).toBe(authChainUser);
+    });
+
+    it('a password containing a colon is preserved whole, not truncated at the first colon', () => {
+      const {plugin} = createPlugin();
+      const authenticate = vi.fn((user, password, cb) => cb(null, false));
+      plugin.register_middlewares(express(), {authenticate} as any);
+      const handler = (plugin as any).apiJWTmiddleware(makeHelpers());
+      const req = makeReq({
+        authorization: basicAuthHeader('someuser', 'pass:with:colons'),
+      });
+      handler(req, {}, () => {});
+
+      expect(authenticate).toHaveBeenCalledWith(
+        'someuser',
+        'pass:with:colons',
+        expect.any(Function),
+      );
+    });
+
+    it('stays anonymous, without an error, when the auth chain rejects the credential', () => {
+      const {plugin} = createPlugin();
+      const authenticate = vi.fn((user, password, cb) => cb(null, false));
+      plugin.register_middlewares(express(), {authenticate} as any);
+      const handler = (plugin as any).apiJWTmiddleware(makeHelpers());
+      const req = makeReq({
+        authorization: basicAuthHeader('someuser', 'wrong-password'),
+      });
+      handler(req, {}, () => {});
+
+      expect((req.remote_user as {error?: string}).error).toBeUndefined();
+      expect(req.remote_user.name).toBeUndefined();
+    });
+
+    it('propagates a real error from the auth chain', () => {
+      const {plugin} = createPlugin();
+      const authenticate = vi.fn((user, password, cb) =>
+        cb(new Error('storage unavailable'), false),
+      );
+      plugin.register_middlewares(express(), {authenticate} as any);
+      const handler = (plugin as any).apiJWTmiddleware(makeHelpers());
+      const req = makeReq({
+        authorization: basicAuthHeader('someuser', 'irrelevant'),
+      });
+      handler(req, {}, () => {});
+
+      expect((req.remote_user as {error?: string}).error).toBe(
+        'storage unavailable',
+      );
+    });
+
+    it('fails closed with a clear error if register_middlewares never ran', () => {
+      const {plugin} = createPlugin();
+      const handler = (plugin as any).apiJWTmiddleware(makeHelpers());
+      const req = makeReq({
+        authorization: basicAuthHeader('someuser', 'irrelevant'),
+      });
+      expect(() => {
+        handler(req, {}, () => {});
+      }).not.toThrow();
+
+      expect((req.remote_user as {error?: string}).error).toBe(
+        'authentication is not ready',
+      );
+    });
   });
 });

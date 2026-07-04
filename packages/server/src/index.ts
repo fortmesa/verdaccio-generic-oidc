@@ -98,6 +98,12 @@ export default class OidcPlugin
   private ts!: ITokenStorage;
   private sessionTtl!: number;
   private usePkce!: boolean;
+  // Captured from register_middlewares() below -- apiJWTmiddleware(helpers)
+  // only receives the narrow {createAnonymousRemoteUser, createRemoteUser}
+  // helpers, not this. Needed to delegate Basic-Auth-scheme requests (e.g.
+  // htpasswd, or a static CI credential) to the *real*, multi-plugin auth
+  // chain instead of only ever checking this plugin's own OIDC sessions.
+  private authChain?: IBasicAuth<OidcPluginConfig>;
 
   constructor(
     config: OidcPluginConfig,
@@ -360,15 +366,57 @@ export default class OidcPlugin
       }
 
       const authorizationParts = authorization.split(' ', 2);
-      if (
-        authorizationParts.length !== 2 ||
-        authorizationParts[0] !== TOKEN_BEARER
-      ) {
+      if (authorizationParts.length !== 2) {
         plugin.logger.warn(
           {scheme: authorizationParts[0]},
-          'unsupported authorization encoding or scheme @{scheme}',
+          'malformed authorization header @{scheme}',
         );
-        return next(new Error('unsupported authorization encoding or scheme'));
+        return next(new Error('malformed authorization header'));
+      }
+
+      if (authorizationParts[0] !== TOKEN_BEARER) {
+        // Not one of our own bearer tokens -- e.g. htpasswd, or a static
+        // Basic-Auth credential (a CI build's own ident). This plugin
+        // replaces Verdaccio's own apiJWTmiddleware entirely (Verdaccio only
+        // calls a plugin-provided one, never both), so without this, no
+        // sibling auth plugin configured alongside this one -- htpasswd
+        // included -- could ever authenticate anything: confirmed directly,
+        // removing this plugin restored htpasswd's Basic-Auth login.
+        // Delegating here, rather than only checking this plugin's own
+        // authenticate() (which only knows its own OIDC sessions), is what
+        // makes every configured auth plugin reachable again, not just this
+        // one -- exactly the "htpasswd fallback" the config already assumes.
+        // Async here is fine: unlike the OIDC-session check below (which
+        // runs on every single Bearer request, including ones headed for
+        // Verdaccio's web UI), Basic-Auth only happens once per login
+        // exchange and never targets the web UI's own routes.
+        if (!plugin.authChain) {
+          plugin.logger.error(
+            {},
+            'authChain not set -- register_middlewares() must run before apiJWTmiddleware() handles a request',
+          );
+          return next(new Error('authentication is not ready'));
+        }
+        const [basicUser, basicPassword] = Buffer.from(
+          authorizationParts[1],
+          'base64',
+        )
+          .toString('utf8')
+          .split(/:(.*)/s, 2);
+        plugin.authChain.authenticate(
+          basicUser,
+          basicPassword,
+          (err: Error | null, authenticatedUser: RemoteUserEx | false) => {
+            if (err) {
+              return next(err);
+            }
+            if (authenticatedUser) {
+              req.remote_user = authenticatedUser;
+            }
+            next();
+          },
+        );
+        return;
       }
 
       const jwtRaw = authorizationParts[1];
@@ -439,6 +487,7 @@ export default class OidcPlugin
     auth: IBasicAuth<OidcPluginConfig>,
   ): void {
     const plugin = this.getInstance();
+    plugin.authChain = auth;
     app.put(
       '/-/user/org.couchdb.user::userId',
       express.json(),
@@ -461,39 +510,89 @@ export default class OidcPlugin
               this.unauthorized(res, 'User ID in URL and body do not match.');
               return;
             }
-            const client = await plugin.clientPromise;
-            // client_id/client_secret (or lack thereof) are already applied
-            // per the Client's own configured token_endpoint_auth_method --
-            // repeating them here would put a literal client_secret:
-            // undefined in the request body for a PKCE/public client.
-            const tokenSet = await client.grant({
-              grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange',
-              requested_token_type:
-                'urn:ietf:params:oauth:token-type:refresh_token',
-              subject_token: subjectToken,
-              subject_token_type:
-                'urn:ietf:params:oauth:token-type:access_token',
-              scope: plugin.config.scope,
-            });
+            // This URL is also the one plain `npm login`/`yarn login` are
+            // hardcoded, client-side, to call -- reusing it (rather than a
+            // separate route) is what lets a token obtained out-of-band
+            // (e.g. via `npx verdaccio-openid`) work by just pasting it into
+            // `npm login`'s password prompt, no custom client needed. So
+            // `password` here is tried as an OIDC access token first; a real
+            // password (htpasswd, or any other sibling auth plugin) will
+            // always fail this exchange -- that failure isn't a real error,
+            // it just means this wasn't an OIDC token, so fall through to
+            // the actual configured auth chain below instead of rejecting.
+            try {
+              const client = await plugin.clientPromise;
+              // client_id/client_secret (or lack thereof) are already
+              // applied per the Client's own configured
+              // token_endpoint_auth_method -- repeating them here would put
+              // a literal client_secret: undefined in the request body for
+              // a PKCE/public client.
+              const tokenSet = await client.grant({
+                grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange',
+                requested_token_type:
+                  'urn:ietf:params:oauth:token-type:refresh_token',
+                subject_token: subjectToken,
+                subject_token_type:
+                  'urn:ietf:params:oauth:token-type:access_token',
+                scope: plugin.config.scope,
+              });
 
-            const tokenUsername = this.getUsername(tokenSet);
-            if (userName !== tokenUsername) {
-              this.unauthorized(
-                res,
-                'Access token is not issued for the user trying to log in.',
+              const tokenUsername = this.getUsername(tokenSet);
+              if (userName !== tokenUsername) {
+                this.unauthorized(
+                  res,
+                  'Access token is not issued for the user trying to log in.',
+                );
+                return;
+              }
+
+              const sessionId = await nanoid();
+              const {npmToken} = await this.saveSessionAndCreateTokens(
+                sessionId,
+                tokenSet,
+                auth,
               );
+              res.status(201);
+              res
+                .set('Content-Type', 'application/json')
+                .end(JSON.stringify({token: npmToken}));
               return;
+            } catch (oidcErr) {
+              plugin.logger.debug(
+                {err: oidcErr},
+                "PUT /-/user: password isn't a valid OIDC access token (@{!err.message}) -- trying the configured auth chain instead",
+              );
             }
 
-            const sessionId = await nanoid();
-            const {npmToken} = await this.saveSessionAndCreateTokens(
-              sessionId,
-              tokenSet,
-              auth,
+            plugin.authChain?.authenticate(
+              userName,
+              subjectToken,
+              (err: Error | null, remoteUser: RemoteUserEx | false) => {
+                if (err) {
+                  return next(err);
+                }
+                if (!remoteUser) {
+                  this.unauthorized(res, 'Invalid username or password.');
+                  return;
+                }
+                Promise.resolve(
+                  (auth as any).jwtEncrypt(remoteUser, {
+                    expiresIn:
+                      this.options.config.security?.api?.jwt?.sign?.expiresIn,
+                  }),
+                )
+                  .then((token: unknown) => {
+                    res.status(201);
+                    res.set('Content-Type', 'application/json').end(
+                      JSON.stringify({
+                        ok: `user '${userName}' created`,
+                        token,
+                      }),
+                    );
+                  })
+                  .catch(next);
+              },
             );
-            const responseBody = JSON.stringify({token: npmToken});
-            res.status(201);
-            res.set('Content-Type', 'application/json').end(responseBody);
           })
           .catch(next);
       },

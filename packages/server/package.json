@@ -1,6 +1,6 @@
 {
   "name": "@fortmesa/verdaccio-generic-oidc",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "Generic OpenID Connect authentication plugin for Verdaccio, with configurable groups/roles mapping and pluggable session storage (Redis, filesystem, or DynamoDB). Fork of verdaccio-openid-connect.",
   "license": "MIT",
   "repository": "fortmesa/verdaccio-generic-oidc",
