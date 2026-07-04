@@ -104,7 +104,7 @@ web:
           const a = document.createElement('a');
           a.href = '/-/oidc/start';
           a.textContent = 'Sign in with Google';
-          a.style.cssText = 'position:fixed;bottom:16px;right:16px;padding:8px 16px;background:#4285F4;color:#fff;border-radius:4px;text-decoration:none;font-size:14px;z-index:9999';
+          a.style.cssText = 'position: fixed; bottom: 16px; right: 16px; padding: 8px 16px; background: #4285F4; color: #fff; border-radius: 4px; text-decoration: none; font-size: 14px; z-index: 9999;';
           document.body.appendChild(a);
         });
       </script>

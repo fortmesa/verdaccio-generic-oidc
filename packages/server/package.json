@@ -1,6 +1,6 @@
 {
   "name": "@fortmesa/verdaccio-generic-oidc",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Generic OpenID Connect authentication plugin for Verdaccio, with configurable groups/roles mapping and pluggable session storage (Redis, filesystem, or DynamoDB). Fork of verdaccio-openid-connect.",
   "license": "MIT",
   "repository": "fortmesa/verdaccio-generic-oidc",
@@ -46,8 +46,8 @@
     "openid-client": "^5.7.0"
   },
   "peerDependencies": {
-    "@aws-sdk/client-dynamodb": "^3.1014.0",
-    "@aws-sdk/lib-dynamodb": "^3.1014.0",
+    "@aws-sdk/client-dynamodb": "^3.0.0",
+    "@aws-sdk/lib-dynamodb": "^3.0.0",
     "generic-pool": "^3.7.1",
     "ioredis": "^5.4.1"
   },
