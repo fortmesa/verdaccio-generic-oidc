@@ -330,11 +330,13 @@ export default class OidcPlugin
       _res: express.Response,
       _next: express.NextFunction,
     ) => {
-      req.pause();
-
+      // Deliberately synchronous end-to-end: an async gap here (even a
+      // same-tick microtask, e.g. a session-storage lookup) corrupts
+      // Verdaccio's own nested web-UI router dispatch for this request --
+      // reproduced directly against real Verdaccio + Express, independent
+      // of req.pause()/resume() -- so this middleware must never await
+      // anything before calling next().
       const next = function (err?: Error) {
-        req.resume(); // uncomment this to reject users with bad auth headers
-        // return _next.apply(null, arguments)
         // swallow error, user remains unauthorized
         // set remoteUserError to indicate that user was attempting authentication
 
@@ -406,14 +408,7 @@ export default class OidcPlugin
         return next(new Error('unable to verify jwt bearer token'));
       }
 
-      const {sid, name, real_groups} = jwtPayload as RemoteUserEx;
-      if (!sid) {
-        plugin.logger.error(
-          {},
-          'incoming jwt token does not contain [sid] claim',
-        );
-        return next(new Error('jwt token does not contain sid'));
-      }
+      const {name, real_groups} = jwtPayload as RemoteUserEx;
       if (!name) {
         plugin.logger.error(
           {},
@@ -429,45 +424,13 @@ export default class OidcPlugin
         return next(new Error('jwt token does not contain real_groups'));
       }
 
-      this.authenticate(name, sid, (err, groups) => {
-        if (err) {
-          plugin.logger.error(
-            {err},
-            'auth error: @{!err.message}\n@{err.stack}',
-          );
-          return next(err);
-        }
-        if (!groups) {
-          plugin.logger.error(
-            {sid},
-            'unable to find session groups for incoming jwt token session @{sid}',
-          );
-          return next(
-            new Error(
-              'unable to find session groups for incoming jwt token session',
-            ),
-          );
-        }
-
-        const groupsWithoutUser: string[] = groups.slice(1);
-        const rolesClaim = plugin.config.roles?.claim;
-        if (rolesClaim) {
-          if (!real_groups.every(v => groupsWithoutUser.includes(v))) {
-            plugin.logger.error(
-              {},
-              'incoming token contains [real_groups] claim that is not a subset of the oidc server roles claim',
-            );
-            return next(
-              new Error(
-                'incoming token contains [real_groups] claim that is not a subset of the oidc server roles claim',
-              ),
-            );
-          }
-        }
-
-        req.remote_user = helpers.createRemoteUser(name, groupsWithoutUser);
-        next();
-      });
+      // No session-storage lookup here: jwt.verify() above already confirms
+      // this exact {name, real_groups} pair was signed by us and has not
+      // expired (its own `exp` claim), which is what's trusted. This trades
+      // away near-real-time revocation (a logged-out session stays valid
+      // until its token's own expiresIn elapses) for staying synchronous.
+      req.remote_user = helpers.createRemoteUser(name, real_groups);
+      next();
     };
   }
 

@@ -613,6 +613,11 @@ describe('OidcPlugin: apiJWTmiddleware() bearer token handling', () => {
         groups: [],
         real_groups: [],
       }),
+      createRemoteUser: (name: string, real_groups: string[]) => ({
+        name,
+        real_groups,
+        groups: [...real_groups, '$all', '$authenticated'],
+      }),
     };
   }
 
@@ -672,5 +677,39 @@ describe('OidcPlugin: apiJWTmiddleware() bearer token handling', () => {
       'unable to verify jwt bearer token',
     );
     expect(logger.error).toHaveBeenCalled();
+  });
+
+  it('a valid, own-issued token authenticates synchronously from its own claims, with no session-storage lookup', () => {
+    const {plugin} = createPlugin();
+    const handler = (plugin as any).apiJWTmiddleware(makeHelpers());
+    const validToken = jwt.sign(
+      {sid: 'irrelevant-now', name: 'alice', real_groups: ['fortmesa.com']},
+      JWT_SECRET,
+    );
+    const req = makeReq({authorization: `Bearer ${validToken}`});
+    let nextCalled = false;
+    // No async gap: an async gap here breaks Verdaccio's own web-UI route
+    // dispatch (reproduced directly against a real Verdaccio server) -- this
+    // asserts next() fires within the same synchronous call, not just
+    // eventually.
+    handler(req, {}, () => {
+      nextCalled = true;
+    });
+
+    expect(nextCalled).toBe(true);
+    expect((req.remote_user as {error?: string}).error).toBeUndefined();
+    expect(req.remote_user.name).toBe('alice');
+    expect(req.remote_user.real_groups).toEqual(['fortmesa.com']);
+  });
+
+  it('a valid token with no [sid] claim still authenticates -- sid is no longer read', () => {
+    const {plugin} = createPlugin();
+    const handler = (plugin as any).apiJWTmiddleware(makeHelpers());
+    const validToken = jwt.sign({name: 'alice', real_groups: []}, JWT_SECRET);
+    const req = makeReq({authorization: `Bearer ${validToken}`});
+    handler(req, {}, () => {});
+
+    expect((req.remote_user as {error?: string}).error).toBeUndefined();
+    expect(req.remote_user.name).toBe('alice');
   });
 });
