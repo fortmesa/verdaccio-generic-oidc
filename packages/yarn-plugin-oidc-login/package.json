@@ -5,7 +5,8 @@
   "description": "Yarn Berry plugin: automatically drives verdaccio-generic-oidc's npm web-login handshake when a request has no token or gets a stale-token 401, instead of yarn just failing.",
   "license": "MIT",
   "scripts": {
-    "build": "builder build plugin"
+    "build": "builder build plugin",
+    "test:cli-real": "node test/cli-real.js"
   },
   "devDependencies": {
     "@yarnpkg/builder": "^4.2.3",

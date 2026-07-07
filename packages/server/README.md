@@ -74,9 +74,11 @@ Note: your OpenID Connect client must be configured to allow
 
 `POST /-/v1/login` (used above by `npm login --auth-type=web` /
 `yarn npm login --web-login`) returns JSON, not something a person can click --
-it exists for the CLI's own polling handshake, not for a browser. For a human
-who wants to log into the registry's web UI itself, without running any CLI
-command first, this plugin also exposes:
+it exists for the CLI's own polling handshake, not for a browser (see
+[Why `/-/v1/login` polls `doneUrl`](../../docs/web-login-protocol.md) for why
+it's a polling handshake at all, rather than a direct PKCE/device-grant exchange
+the CLI does itself). For a human who wants to log into the registry's web UI
+itself, without running any CLI command first, this plugin also exposes:
 
 - **`GET /-/oidc/start`** -- a plain, unauthenticated link. Mints the same
   signed, rate-limited login request the CLI flow uses and redirects straight
@@ -109,6 +111,110 @@ web:
         });
       </script>
 ```
+
+## Logging in from the CLI with nothing configured yet
+
+Without [yarn-plugin-oidc-login](../yarn-plugin-oidc-login), Yarn's normal
+behavior on a missing/expired token is to fail the command with an auth error
+and stop -- you then have to separately run a login command yourself and rerun
+whatever you were originally doing. The plugin is a quality-of-life improvement
+on top of that, not a different mechanism: it detects that same error inline,
+drives the identical `/-/v1/login` -> `doneUrl` handshake
+`npm login --auth-type=web`/`yarn npm login --web-login` already speak on their
+own, and then lets the original command continue -- so it collapses "fail, log
+in separately, rerun" into one step, on any command, without you ever typing a
+login command yourself. It does **not** remove the need for the `.yarnrc.yml`
+registry configuration below (`npmRegistryServer`/ `npmScopes` +
+`npmAlwaysAuth: true`) -- with or without the plugin, Yarn still needs to be
+told which registry to use and that it requires auth; the plugin only removes
+the manual "run a login command, then rerun" round trip. See the plugin's own
+[Required `.yarnrc.yml` shape](../../docs/yarn-integration.md#required-yarnrcyml-shape).
+npm has no equivalent plugin at all, so it's always the manual flow below.
+
+Everything below works with no plugin installed at all: no existing token, no
+`.npmrc`/`.yarnrc.yml`, just the registry's URL. Verified directly against a
+real instance of this server. Requires `accessTokenAuth` to not be set to `true`
+in the plugin's config (the default), since that flag disables `/-/v1/login`
+entirely -- see [Configuration reference](../../docs/configuration.md).
+
+### npm
+
+`npm login --auth-type=web` is fully driven by CLI flags -- no config file
+needed first. Behavior differs depending on whether you pass `--scope`:
+
+```bash
+# This registry only hosts packages under one scope (the common case for a
+# private registry): logs in AND remembers "@myorg packages come from here"
+# in one step.
+npm login --auth-type=web --registry=https://your-registry.example.com --scope=@myorg
+```
+
+```bash
+# This registry should be the default for everything (a full proxy/mirror,
+# not just one scope): the login itself still only needs the flags above
+# (drop --scope), but --auth-type=web/login on its own does NOT persist a
+# default registry for later commands -- confirmed directly, only the auth
+# token gets saved. Set the default explicitly too:
+npm login --auth-type=web --registry=https://your-registry.example.com
+npm config set registry https://your-registry.example.com
+```
+
+Both `npm login` and `npm config set` write to your **user-level** `~/.npmrc` by
+default (not the current project's) -- nothing else to set up.
+
+One gotcha, confirmed directly: if you'd rather use a **project-level** `.npmrc`
+instead (e.g. `registry=https://your-registry.example.com` or
+`@myorg:registry=...` committed to a repo), npm only reads it at all if a
+`package.json` already exists in that same directory -- an `.npmrc` sitting in
+an otherwise-empty folder is silently ignored in favor of the real public
+registry, with no warning.
+
+### Yarn (Berry)
+
+Unlike npm, `yarn npm login` has no `--registry` flag at all
+(`yarn npm login --help`) -- it only ever reads the registry from existing
+config, so something has to be configured first. Put this in your **user-level**
+`~/.yarnrc.yml`, not the project's, unless you specifically want it scoped to
+one repo:
+
+```yaml
+# Scoped (this registry only hosts @myorg packages):
+npmScopes:
+  myorg:
+    npmRegistryServer: 'https://your-registry.example.com'
+npmRegistries:
+  'https://your-registry.example.com':
+    npmAlwaysAuth: true
+```
+
+```yaml
+# Or unscoped (this registry is the default for everything):
+npmRegistryServer: 'https://your-registry.example.com'
+npmRegistries:
+  'https://your-registry.example.com':
+    npmAlwaysAuth: true
+```
+
+Then log in:
+
+```bash
+yarn npm login --web-login             # unscoped
+yarn npm login --web-login --scope myorg   # scoped
+```
+
+This is interactive -- it asks "Do you want to try to open your browser now?"
+and expects a real terminal to answer it, so it's not meant to be scripted/run
+headless (see [Yarn integration](../../docs/yarn-integration.md) for the fully
+automated alternative, the companion
+[yarn-plugin-oidc-login](../yarn-plugin-oidc-login) plugin, which skips this
+prompt entirely and drives the same handshake transparently during a normal
+`yarn install`). Like npm, the resulting token is written to your **user-level**
+`$HOME/.yarnrc.yml`, never the project's -- confirmed directly, and the same
+mechanism the plugin itself uses (see
+[Where the token actually lives](../../docs/yarn-integration.md#where-the-token-actually-lives)).
+If you configured the registry in the _project's_ `.yarnrc.yml` instead of your
+home one, that part stays there; only the token itself always lands in your home
+config.
 
 ## Baking a storage backend into your own Docker image
 

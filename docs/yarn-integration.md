@@ -1,11 +1,61 @@
 # Yarn (Berry) integration
 
-`packages/yarn-plugin-oidc-login` is a small Yarn Berry plugin: when
-`yarn install` (or any other command touching the registry) has no token
-configured, or gets a 401 because a previously-good token expired, it
-automatically drives this server's login handshake instead of just failing.
-Everything below is verified against a real Keycloak + verdaccio devcontainer,
-not just written from the design.
+`packages/yarn-plugin-oidc-login` is a small Yarn Berry plugin: a
+quality-of-life improvement over Yarn's normal behavior, not a different login
+mechanism. Without it, `yarn install` (or any other command touching the
+registry) with no token configured, or a 401 because a previously-good token
+expired, just fails with an auth error -- you then have to separately run a
+login command and rerun whatever you were doing. With the plugin installed, it
+detects that same condition inline and automatically drives this server's login
+handshake itself, then lets the original command continue -- collapsing "fail,
+log in separately, rerun" into one step. Everything below is verified against a
+real Keycloak + verdaccio devcontainer, not just written from the design.
+
+## Yarn version support
+
+**Only Yarn 3.x and 4.x are supported.** The plugin depends on two Yarn Berry
+hooks -- `getNpmAuthenticationHeader` (supplies the auth header before a request
+goes out) and `wrapNetworkRequest` (retries a stale-token 401 with a
+freshly-obtained one) -- and neither exists in Yarn 2.x. Confirmed directly
+against each version's own bundled `yarn.js`: zero matches for either hook name
+in yarn 2.4.3, versus one match each in 3.8.7 and two/one in 4.17.0.
+`yarn plugin import` still succeeds on 2.x with no error -- a silent no-op, not
+a loud failure -- so don't rely on an import-time error to catch a 2.x project;
+both hooks simply never fire. Yarn Classic (1.x) isn't Yarn Berry at all and was
+never a candidate.
+
+See `packages/yarn-plugin-oidc-login/test/cli-real.js`
+(`yarn workspace @fortmesa/yarn-plugin-oidc-login test:cli-real`) for the real,
+corepack-driven test against both supported versions -- separate from the rest
+of this monorepo's fast/offline test suite since it activates real Yarn releases
+and spins up a real local HTTP server.
+
+## Command coverage: more than just install/add
+
+Both hooks fire for every `yarn npm` subcommand that actually touches the
+registry, not just package installation -- confirmed directly with a
+debug-instrumented copy of this plugin (temporary `console.error` calls inside
+both hooks, not inferred from error text alone) run against real Yarn
+3.8.7/4.17.0 for: `add`/`install` (the original motivating case), `npm audit`,
+`npm info`, `npm publish`, `npm tag add`/`list`, and `npm stage list`.
+`npm logout` makes no network call at all -- it's a purely local config-file
+edit, nothing for either hook to intercept.
+
+This isn't a coincidence needing per-command support: `@yarnpkg/plugin-npm`
+funnels every one of these operations through the same shared HTTP/auth-header
+pipeline `getNpmAuthenticationHeader` and `wrapNetworkRequest` are wired into,
+rather than reimplementing auth per subcommand. That's _why_ one pair of hooks
+is enough to cover the whole `yarn npm` surface, not just the install path this
+plugin was originally built for.
+
+`test/cli-real.js` encodes four of these as permanent regression checks against
+both supported Yarn versions -- `add`, `npm whoami` (a read), `npm publish` (a
+write), and `npm audit` (a bulk query) -- chosen to be representative of the
+shared pipeline above rather than exhaustively re-testing every subcommand that
+goes through the exact same code path. If a future Yarn release ever splits one
+of these onto a different code path (unlikely, but this is exactly the kind of
+internal-architecture assumption that a version bump could quietly break), one
+of those four checks should catch it.
 
 ## Installing the plugin
 
@@ -56,6 +106,11 @@ into the same container since it's a real file, not a shell-scoped environment
 variable.
 
 ## What actually happens on a cold install
+
+See [Why `/-/v1/login` polls `doneUrl`](web-login-protocol.md) for why step 4
+below is a polling handshake at all, rather than Yarn doing a PKCE/device-grant
+exchange itself the way `aws sso login` does -- that's npm's own client-side
+protocol design, not something this plugin or the server it talks to chose.
 
 Confirmed via server request logs during real testing, not assumed:
 

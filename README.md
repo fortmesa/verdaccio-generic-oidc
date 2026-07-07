@@ -22,6 +22,8 @@ This fork adds:
   [`@fortmesa/verdaccio-generic-oidc`](https://www.npmjs.com/package/@fortmesa/verdaccio-generic-oidc).
 - [`packages/yarn-plugin-oidc-login`](packages/yarn-plugin-oidc-login) -- not
   published to npm; distributed as a built `.cjs` via `yarn plugin import`.
+  **Supports Yarn 3.x and 4.x only** -- see
+  [Yarn version support](docs/yarn-integration.md#yarn-version-support).
 
 ## Development
 
@@ -58,3 +60,6 @@ consequence to it also listing them as devDependencies.
   [Google Workspace](docs/google-workspace.md), [Keycloak](docs/keycloak.md),
   [Azure Entra ID](docs/azure-entra-id.md)
 - [Yarn integration](docs/yarn-integration.md)
+- [Why `/-/v1/login` polls `doneUrl`](docs/web-login-protocol.md) -- why this
+  can't be a "real" PKCE/device-grant CLI flow like `aws sso login`'s, and whose
+  design choice (not this project's) that actually is.
