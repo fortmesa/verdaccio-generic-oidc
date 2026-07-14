@@ -45,8 +45,15 @@ export function NewFileStorage(
   };
 }
 
+// base64url, not plain base64: this is a fully attacker-controlled key (the
+// FileTokenStorage caller passes the raw Basic-Auth password straight
+// through as `key`) used verbatim as a filename -- plain base64's alphabet
+// includes '/', which can and does appear in real output and would land in
+// an unintended subdirectory once joined onto a path. base64url's alphabet
+// ('-'/'_' in place of '+'/'/', no padding) has no character that's ever
+// meaningful to a filesystem path.
 function btoa(s: string): string {
-  return Buffer.from(s).toString('base64');
+  return Buffer.from(s).toString('base64url');
 }
 
 async function gc(logger: Logger, pathSpec: {path: string; ext: string[]}[]) {

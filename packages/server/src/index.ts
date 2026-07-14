@@ -868,6 +868,21 @@ function signPayload(
   });
 }
 
+// JSON.stringify alone only guarantees valid *JS string* syntax -- it never
+// escapes the "<" character, so a value containing a literal "</script>"
+// (e.g. an IdP claim an attacker or the user themselves controls, like
+// usernameClaim) closes the surrounding <script> element at the HTML
+// parser's own layer before the JS engine ever gets to interpret the
+// quotes JSON.stringify added, letting arbitrary markup/script after it
+// execute as its own, separate <script> tag. Every "<" is rewritten to the
+// six-character JS string escape sequence for it below -- still a
+// perfectly valid part of the same JS string literal (the JS engine
+// decodes it back to a literal "<" once parsed), but the raw HTML source
+// never contains an actual "<" character there for the HTML parser's own
+// `</script` scan to find.
+const escapeForInlineScript = (value: string) =>
+  JSON.stringify(value).replace(/</g, '\\u003c');
+
 const callbackResponseHtml = (username: string, token: string) => `
 <!DOCTYPE html>
 <html>
@@ -875,8 +890,8 @@ const callbackResponseHtml = (username: string, token: string) => `
   </head>
   <body>
     <script>
-      localStorage.setItem('username', ${JSON.stringify(username)});
-      localStorage.setItem('token', ${JSON.stringify(token)});
+      localStorage.setItem('username', ${escapeForInlineScript(username)});
+      localStorage.setItem('token', ${escapeForInlineScript(token)});
     </script>
     You are now authenticated in npm and on this website. You can close this
     tab, or <a href="/">continue to the site</a>.

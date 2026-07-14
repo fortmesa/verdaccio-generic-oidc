@@ -330,6 +330,32 @@ describe('OidcPlugin: full login flow (confidential client)', () => {
     }
   });
 
+  it('escapes a "</script>"-shaped username claim so it cannot break out of the callback page\'s inline <script> block', async () => {
+    const payload = '</script><script>window.pwned=true</script>';
+    issuer.state.claims = {preferred_username: payload};
+    const {plugin, config} = createPlugin();
+    const server = await startServer(plugin, config, makeAuth());
+    try {
+      const {callbackHtml} = await performLogin(server.baseUrl);
+
+      // The raw HTML must never contain an actual "</script>" sequence
+      // originating from the claim value -- only the two real <script>
+      // tags this page itself renders.
+      const scriptCloseCount = (callbackHtml.match(/<\/script>/g) ?? []).length;
+      expect(scriptCloseCount).toBe(2);
+      // The value must still be recoverable as the original string once
+      // actually parsed as JS -- confirms this is an escape, not a filter
+      // that mangles/drops the content. Only "<" needs escaping (it's the
+      // one character the HTML parser's `</script` scan cares about) --
+      // ">" is left as a literal character, same as JSON.stringify would
+      // have produced.
+      expect(callbackHtml).toContain('\\u003c/script>\\u003cscript>');
+    } finally {
+      await server.close();
+      plugin.close();
+    }
+  });
+
   it('extracts roles into real_groups per the configured claim', async () => {
     issuer.state.claims = {
       preferred_username: 'alice',

@@ -64,6 +64,21 @@ describe('NewFileStorage: session storage', () => {
     expect(files).toHaveLength(1);
     expect(files[0]).not.toContain('/');
   });
+
+  it('uses base64url, not plain base64, so a key that would produce a "/" under plain base64 never does', async () => {
+    // Buffer.from('session:?abc').toString('base64') is
+    // 'c2Vzc2lvbjo/YWJj' -- a real, plain-base64 '/' in the encoded output,
+    // not a contrived one. FileTokenStorage's key is a caller-supplied,
+    // fully attacker-controlled Basic-Auth password, so this isn't a
+    // hypothetical input.
+    const {ss} = NewFileStorage(makeLogger(), tmpDir, tmpDir);
+    await ss.set('session:?abc', new TokenSet({}), 300);
+
+    const files = await fs.readdir(tmpDir);
+    expect(files).toHaveLength(1);
+    expect(files[0]).not.toContain('/');
+    expect(await ss.get('session:?abc')).toEqual({});
+  });
 });
 
 describe('NewFileStorage: token storage', () => {

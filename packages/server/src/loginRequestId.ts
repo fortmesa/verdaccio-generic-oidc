@@ -8,8 +8,16 @@ import {nanoid} from 'nanoid/async';
 const HMAC_BYTES = 16;
 
 // Total time a signed id remains acceptable at all, regardless of how many
-// times it's used within that window.
-export const MAX_AGE_SEC = 10 * 60;
+// times it's used within that window. Deliberately short: this is also the
+// realistic window for the device-code-phishing-style risk described in
+// docs/web-login-protocol.md (an attacker mints an id, hands loginUrl to a
+// victim, then polls doneUrl themselves) -- npm/Yarn's own client protocol
+// gives no way to close that off outright (see that doc), so keeping this
+// window tight is the one thing this project can still do to shrink the
+// realistic attack window, short of breaking real login usability. 90s
+// is the floor a real human needs to open the browser, authenticate with
+// the IdP, and land back on the callback page.
+export const MAX_AGE_SEC = 90;
 
 // A legitimate login flow touches storage a small, predictable number of
 // times: one write at /-/oidc/login, one read (plus a possible PKCE lookup)

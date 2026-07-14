@@ -275,4 +275,4 @@ jobs:
       - name: Publish to npmjs.dev.fort.blue
         run:
           yarn workspace @fortmesa/verdaccio-generic-oidc npm publish --access
-          public
+          public --provenance
