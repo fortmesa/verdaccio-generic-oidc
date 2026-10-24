@@ -96,6 +96,23 @@ describe('extractGroups: object-shaped claims (map -> array, e.g. verdaccio-bitb
     const result = extractGroups(claims, {roles: {claim: 'teams'}}, logger);
     expect(result.sort()).toEqual(['team1', 'team2']);
   });
+
+  it('counts a key only when its value is true, an array, or a role object, never false or another scalar', () => {
+    const logger = makeLogger();
+    const claims = {
+      teams: {
+        member: true,
+        notMember: false,
+        nulled: null,
+        text: 'yes',
+        count: 1,
+        emptyObject: {},
+        roles: ['write'],
+      },
+    };
+    const result = extractGroups(claims, {roles: {claim: 'teams'}}, logger);
+    expect(result.sort()).toEqual(['member', 'roles']);
+  });
 });
 
 describe('extractGroups: object-of-objects claims (Keycloak resource_access.<client>.roles)', () => {

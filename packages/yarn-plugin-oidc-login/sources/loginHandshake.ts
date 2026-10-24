@@ -5,7 +5,8 @@ import {Configuration, httpUtils, nodeUtils} from '@yarnpkg/core';
  * (verdaccio-generic-oidc's server implements it):
  *
  *   POST /-/v1/login          -> {loginUrl, doneUrl}
- *   open loginUrl in a browser (real OIDC provider consent happens there)
+ *   open loginUrl in a browser (the person confirms, then signs in with the
+ *   real OIDC provider there)
  *   poll doneUrl               -> 202 while pending, 200 {token} once done
  *
  * This is the same protocol `npm login --auth-type=web` and
@@ -27,16 +28,88 @@ const inFlight = new Map<string, Promise<string | undefined>>();
 
 // The actual fix for repeat logins within one process: persistToken() below
 // only writes to $HOME/.yarnrc.yml for *future* processes (see its own
-// comment) -- this process's own Configuration object, and the
-// currentHeader Yarn resolves from it, are never refreshed mid-run. Without
-// this cache, every single package fetch after the first would see no
-// header configured yet and no in-flight handshake to join, and would kick
-// off (and open a browser for) its own brand new handshake -- exactly the
-// "opens the browser for every fetch" bug this fixes.
+// comment) -- this process's own Configuration object, and the header Yarn
+// resolves from it, are never refreshed mid-run. index.ts checks this cache
+// before the saved token and before starting a new handshake.
 const tokenCache = new Map<string, string>();
+
+// Registries whose POST /-/v1/login answered 404 (no web login there). Not
+// asked again for the rest of this process.
+const unsupported = new Set<string>();
+
+// URLs this module itself is requesting right now. index.ts's 401 handling
+// skips them, so a 401 from the login endpoint can't start another login
+// that waits on the one already running.
+const handshakeTargets = new Set<string>();
+
+export function isHandshakeRequest(target: string | URL): boolean {
+  return handshakeTargets.has(new URL(target).href);
+}
+
+export function cachedToken(registry: string): string | undefined {
+  return tokenCache.get(registry);
+}
 
 function isInteractive(): boolean {
   return Boolean(process.stdout.isTTY) && !process.env.CI;
+}
+
+function warn(message: string): void {
+  // eslint-disable-next-line no-console
+  console.error(`oidc-login: ${message}`);
+}
+
+async function handshakeRequest(
+  target: string,
+  method: httpUtils.Method,
+  configuration: Configuration,
+): Promise<httpUtils.Response> {
+  const href = new URL(target).href;
+  handshakeTargets.add(href);
+  try {
+    return await httpUtils.request(href, null, {
+      configuration,
+      jsonResponse: true,
+      method,
+    });
+  } finally {
+    handshakeTargets.delete(href);
+  }
+}
+
+function statusOf(err: unknown): number | undefined {
+  const e = err as {
+    response?: {statusCode?: number};
+    originalError?: {response?: {statusCode?: number}};
+  };
+  return e?.response?.statusCode ?? e?.originalError?.response?.statusCode;
+}
+
+// loginUrl is opened with the system's URL handler, so it must be a web
+// page; doneUrl returns the token, so it must not drop to plain http when
+// the registry itself is https.
+function validLoginUrls(
+  registry: string,
+  loginUrl: unknown,
+  doneUrl: unknown,
+): {loginUrl: string; doneUrl: string} | undefined {
+  if (typeof loginUrl !== 'string' || typeof doneUrl !== 'string') {
+    return undefined;
+  }
+  let login: URL;
+  let done: URL;
+  try {
+    login = new URL(loginUrl);
+    done = new URL(doneUrl);
+  } catch {
+    return undefined;
+  }
+  const secure = new URL(registry).protocol === 'https:';
+  const allowed = secure ? ['https:'] : ['https:', 'http:'];
+  if (!allowed.includes(login.protocol) || !allowed.includes(done.protocol)) {
+    return undefined;
+  }
+  return {loginUrl: login.href, doneUrl: done.href};
 }
 
 async function persistToken(registry: string, token: string): Promise<void> {
@@ -64,21 +137,36 @@ async function runHandshake(
   configuration: Configuration,
   registry: string,
 ): Promise<string | undefined> {
+  if (unsupported.has(registry)) return undefined;
+
   let loginResponse: httpUtils.Response;
   try {
-    loginResponse = await httpUtils.request(
-      new URL('/-/v1/login', registry),
-      null,
-      {configuration, jsonResponse: true, method: httpUtils.Method.POST},
+    loginResponse = await handshakeRequest(
+      `${registry}/-/v1/login`,
+      httpUtils.Method.POST,
+      configuration,
     );
-  } catch {
-    // Not every registry implements this handshake -- degrade silently and
-    // let normal (config-based) auth resolution proceed.
+  } catch (err) {
+    const status = statusOf(err);
+    if (status === 404) {
+      // Not every registry implements this handshake -- let normal
+      // (config-based) auth resolution proceed, and don't ask again.
+      unsupported.add(registry);
+    } else if (status === 429) {
+      warn(`${registry} refused to start a login: too many login attempts`);
+    } else {
+      warn(`could not start a login at ${registry}: ${(err as Error).message}`);
+    }
     return undefined;
   }
 
-  const {loginUrl, doneUrl} = loginResponse.body ?? {};
-  if (typeof loginUrl !== 'string' || typeof doneUrl !== 'string') {
+  const urls = validLoginUrls(
+    registry,
+    loginResponse.body?.loginUrl,
+    loginResponse.body?.doneUrl,
+  );
+  if (!urls) {
+    warn(`${registry} answered /-/v1/login without usable login URLs`);
     return undefined;
   }
 
@@ -90,19 +178,26 @@ async function runHandshake(
   // worthwhile as a convenience for the common case where it does work.
   // eslint-disable-next-line no-console
   console.log(
-    `To finish logging in to ${registry}, open this URL:\n  ${loginUrl}`,
+    `To finish logging in to ${registry}, open this URL:\n  ${urls.loginUrl}`,
   );
-  await nodeUtils.openUrl?.(loginUrl).catch(() => false);
+  await nodeUtils.openUrl?.(urls.loginUrl).catch(() => false);
 
   const deadline = Date.now() + POLL_TIMEOUT_MS;
   for (;;) {
     let doneResponse: httpUtils.Response;
     try {
-      doneResponse = await httpUtils.request(doneUrl, null, {
+      doneResponse = await handshakeRequest(
+        urls.doneUrl,
+        httpUtils.Method.GET,
         configuration,
-        jsonResponse: true,
-      });
-    } catch {
+      );
+    } catch (err) {
+      const status = statusOf(err);
+      warn(
+        status === 400
+          ? `the login at ${registry} expired before it was finished`
+          : `the login at ${registry} failed: ${(err as Error).message}`,
+      );
       return undefined;
     }
 
@@ -113,7 +208,10 @@ async function runHandshake(
       return doneResponse.body.token;
     }
 
-    if (Date.now() >= deadline) return undefined;
+    if (Date.now() >= deadline) {
+      warn(`gave up waiting for the login at ${registry} to finish`);
+      return undefined;
+    }
 
     const retryAfterHeader = doneResponse.headers['retry-after'];
     const retryAfterSec = Array.isArray(retryAfterHeader)
@@ -161,8 +259,7 @@ function runDedupedHandshake(
 
 /**
  * Used from getNpmAuthenticationHeader: no header configured at all yet.
- * Reuses an already-obtained token for the rest of this process's lifetime
- * -- see tokenCache's own comment for why that's required, not optional.
+ * Reuses an already-obtained token for the rest of this process's lifetime.
  */
 export async function ensureLogin(
   configuration: Configuration,
@@ -177,9 +274,9 @@ export async function ensureLogin(
 }
 
 /**
- * Used from wrapNetworkRequest on a real 401: the cached token (if any) is
- * the one that was just rejected, so it must be discarded before
- * re-authenticating, unlike ensureLogin's normal reuse-what-we-have path.
+ * Used from wrapNetworkRequest once the newest token was refused with a
+ * 401: it's discarded before logging in again, unlike ensureLogin's normal
+ * reuse-what-we-have path.
  */
 export async function refreshLogin(
   configuration: Configuration,

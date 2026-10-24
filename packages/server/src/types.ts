@@ -1,14 +1,11 @@
-import {TokenSet} from 'openid-client';
-
-export interface ISessionStorage {
-  close(): Promise<void>;
-  set(key: string, value: TokenSet, expires_sec: number): Promise<void>;
-  get(key: string): Promise<TokenSet | null>;
-}
-
 export interface ITokenStorage {
   close(): Promise<void>;
   set(key: string, value: string, expires_sec: number): Promise<void>;
-  /** timeoutSec: how long to long-poll for the key to appear, in seconds. */
-  get(key: string, timeoutSec: number): Promise<string | null>;
+  /**
+   * Waits up to timeoutSec seconds for the key to appear, then removes it and
+   * returns its value, or returns null if it never appeared. Removal and read
+   * are one step, so of any number of concurrent callers at most one gets
+   * the value.
+   */
+  consume(key: string, timeoutSec: number): Promise<string | null>;
 }

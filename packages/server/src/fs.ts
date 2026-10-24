@@ -1,140 +1,74 @@
 import * as path from 'path';
 import * as fs from 'fs/promises';
-import {ISessionStorage, ITokenStorage} from './types';
+import {randomBytes} from 'crypto';
+import {ITokenStorage} from './types';
 import {Logger} from '@verdaccio/types';
-import {TokenSet} from 'openid-client';
 
 const TOKEN_FILE_EXT = '.token';
-const SESSION_FILE_EXT = '.session';
 const GC_TIMEOUT = 60 * 1_000;
+const POLL_INTERVAL_MS = 100;
 
 export function NewFileStorage(
   logger: Logger,
-  sessionStoragePath: string,
   tokenStoragePath: string,
-): {ss: ISessionStorage; ts: ITokenStorage} {
-  const gcPathSpec = [{path: sessionStoragePath, ext: [SESSION_FILE_EXT]}];
-
-  if (sessionStoragePath === tokenStoragePath) {
-    gcPathSpec[0].ext.push(TOKEN_FILE_EXT);
-  } else {
-    gcPathSpec.push({path: tokenStoragePath, ext: [TOKEN_FILE_EXT]});
-  }
-
-  setTimeout(() => gc(logger, gcPathSpec), GC_TIMEOUT);
-
-  const stopByExt = (ext: string) => {
-    for (let i = gcPathSpec.length - 1; i >= 0; --i) {
-      const ps = gcPathSpec[i];
-      ps.ext = ps.ext.filter(e => e != ext);
-      if (ps.ext.length === 0) {
-        gcPathSpec.length -= 1;
-      }
-    }
-
-    return Promise.resolve();
-  };
+): {ts: ITokenStorage} {
+  let stopped = false;
+  const timer = setTimeout(function run() {
+    gc(logger, tokenStoragePath).finally(() => {
+      if (!stopped) setTimeout(run, GC_TIMEOUT).unref?.();
+    });
+  }, GC_TIMEOUT);
+  timer.unref?.();
 
   return {
-    ss: new FileSessionStorage(sessionStoragePath, () => {
-      return stopByExt(SESSION_FILE_EXT);
-    }),
     ts: new FileTokenStorage(tokenStoragePath, () => {
-      return stopByExt(TOKEN_FILE_EXT);
+      stopped = true;
+      clearTimeout(timer);
+      return Promise.resolve();
     }),
   };
 }
 
-// base64url, not plain base64: this is a fully attacker-controlled key (the
-// FileTokenStorage caller passes the raw Basic-Auth password straight
-// through as `key`) used verbatim as a filename -- plain base64's alphabet
-// includes '/', which can and does appear in real output and would land in
-// an unintended subdirectory once joined onto a path. base64url's alphabet
-// ('-'/'_' in place of '+'/'/', no padding) has no character that's ever
-// meaningful to a filesystem path.
+// base64url, not plain base64: the key is partly caller-controlled (a login
+// request id from a URL) and becomes a filename. Plain base64's alphabet
+// includes '/', which would land the file in an unintended subdirectory;
+// base64url ('-'/'_' in place of '+'/'/', no padding) has no character a
+// filesystem path treats specially.
 function btoa(s: string): string {
   return Buffer.from(s).toString('base64url');
 }
 
-async function gc(logger: Logger, pathSpec: {path: string; ext: string[]}[]) {
-  if (pathSpec.length === 0) {
-    return;
-  }
-
+async function gc(logger: Logger, dir: string): Promise<void> {
   try {
-    for (const ps of pathSpec) {
-      for (const f of await fs.readdir(ps.path, {encoding: 'utf-8'})) {
-        const ff = path.join(ps.path, f);
-        const stat = await fs.stat(ff);
-        if (stat.isFile()) {
-          const ext = path.extname(f);
-          if (ps.ext.includes(ext)) {
-            const fData = await fs.readFile(ff, {encoding: 'utf-8'});
-            const expires_in = fData.slice(0, fData.indexOf('\n'));
-            if (Date.now() > parseInt(expires_in, 10)) {
-              await fs.rm(ff, {force: true, maxRetries: 3, retryDelay: 10});
-            }
-          }
-        }
+    for (const f of await fs.readdir(dir, {encoding: 'utf-8'})) {
+      if (path.extname(f) !== TOKEN_FILE_EXT) continue;
+      const ff = path.join(dir, f);
+      const entry = await readFileEx(ff).catch(() => null);
+      if (entry != null && isExpired(entry.expires_in)) {
+        await fs.rm(ff, {force: true, maxRetries: 3, retryDelay: 10});
       }
     }
   } catch (err) {
     logger.warn({err}, 'file storage gc error: @{!err.message}\n@{err.stack}');
-  } finally {
-    setTimeout(() => gc(logger, pathSpec), GC_TIMEOUT);
   }
+}
+
+// A file whose first line isn't a number counts as expired. Treating it as
+// valid would never expire it, since every comparison with NaN is false.
+function isExpired(expiresIn: number): boolean {
+  return !Number.isFinite(expiresIn) || Date.now() > expiresIn;
 }
 
 async function readFileEx(
   fName: string,
-): Promise<{expires_in: number; objRaw: any}> {
+): Promise<{expires_in: number; objRaw: string}> {
   const fData = await fs.readFile(fName, {encoding: 'utf-8'});
   const sIdx = fData.indexOf('\n');
-  const expires_in = fData.slice(0, sIdx);
-
+  if (sIdx < 0) return {expires_in: NaN, objRaw: ''};
   return {
-    expires_in: parseInt(expires_in, 10),
+    expires_in: Number(fData.slice(0, sIdx)),
     objRaw: fData.slice(sIdx + 1),
   };
-}
-
-class FileSessionStorage implements ISessionStorage {
-  constructor(
-    private path: string,
-    private fnClose: () => Promise<void>,
-  ) {}
-
-  public async close(): Promise<void> {
-    return this.fnClose();
-  }
-
-  public async set(
-    key: string,
-    value: TokenSet,
-    expires_sec: number,
-  ): Promise<void> {
-    const fName = path.join(this.path, btoa(key) + SESSION_FILE_EXT);
-    const fData = `${Date.now() + 1000 * expires_sec}\n${JSON.stringify(
-      value,
-      null,
-      2,
-    )}`;
-    await fs.writeFile(fName, fData, {encoding: 'utf-8'});
-  }
-
-  public async get(key: string): Promise<TokenSet | null> {
-    try {
-      const fName = path.join(this.path, btoa(key) + SESSION_FILE_EXT);
-      const {expires_in, objRaw} = await readFileEx(fName);
-      if (Date.now() > expires_in) {
-        return null;
-      }
-
-      return JSON.parse(objRaw);
-    } catch (_) {
-      return null;
-    }
-  }
 }
 
 class FileTokenStorage implements ITokenStorage {
@@ -147,56 +81,64 @@ class FileTokenStorage implements ITokenStorage {
     return this.fnClose();
   }
 
+  private fileName(key: string): string {
+    return path.join(this.path, btoa(key) + TOKEN_FILE_EXT);
+  }
+
   public async set(
     key: string,
     value: string,
     expires_sec: number,
   ): Promise<void> {
-    const fName = path.join(this.path, btoa(key) + TOKEN_FILE_EXT);
-    const fData = `${Date.now() + 1000 * expires_sec}\n${value}`;
-    await fs.writeFile(fName, fData, {encoding: 'utf-8'});
-  }
-
-  private async getSync(key: string): Promise<string | null> {
-    try {
-      const fName = path.join(this.path, btoa(key) + TOKEN_FILE_EXT);
-      const {expires_in, objRaw} = await readFileEx(fName);
-      if (Date.now() > expires_in) {
-        return null;
-      }
-
-      return objRaw;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  public async get(key: string, timeoutSec: number): Promise<string | null> {
-    const rv = await this.getSync(key);
-    if (rv != null) {
-      return rv;
-    }
-
-    const eot = Date.now() + timeoutSec * 1000;
-
-    const tFn = (res: (value: any) => void) =>
-      setTimeout(async () => {
-        const rv = await this.getSync(key);
-        if (rv != null) {
-          return res(rv);
-        }
-
-        if (Date.now() < eot) {
-          tFn(res);
-        } else {
-          res(null);
-        }
-      }, 100);
-
-    const rvP = new Promise<string | null>((res, _) => {
-      tFn(res);
+    // Written to a private temp file and renamed into place, so a reader
+    // only ever sees no file or the whole file, and only this user can
+    // read it.
+    const target = this.fileName(key);
+    const temp = `${target}.${randomBytes(6).toString('hex')}.tmp`;
+    await fs.writeFile(temp, `${Date.now() + 1000 * expires_sec}\n${value}`, {
+      encoding: 'utf-8',
+      mode: 0o600,
     });
+    try {
+      await fs.rename(temp, target);
+    } catch (err) {
+      await fs.rm(temp, {force: true});
+      throw err;
+    }
+  }
 
-    return rvP;
+  // rename() is atomic, so of several callers racing for the same file
+  // exactly one moves it and gets to read it; the rest see ENOENT.
+  private async tryConsume(key: string): Promise<string | null> {
+    const target = this.fileName(key);
+    const claimed = `${target}.${randomBytes(6).toString('hex')}.claimed`;
+    try {
+      await fs.rename(target, claimed);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw err;
+    }
+    try {
+      const {expires_in, objRaw} = await readFileEx(claimed);
+      return isExpired(expires_in) ? null : objRaw;
+    } finally {
+      await fs.rm(claimed, {force: true});
+    }
+  }
+
+  public async consume(
+    key: string,
+    timeoutSec: number,
+  ): Promise<string | null> {
+    const deadline = Date.now() + timeoutSec * 1000;
+    for (;;) {
+      const value = await this.tryConsume(key);
+      if (value != null) return value;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return null;
+      await new Promise(resolve =>
+        setTimeout(resolve, Math.min(POLL_INTERVAL_MS, remaining)),
+      );
+    }
   }
 }

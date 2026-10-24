@@ -120,16 +120,29 @@ Confirmed via server request logs during real testing, not assumed:
    Print it either way -- this repo found in real testing that Yarn's `openUrl`
    helper reports success as long as the `open`/`xdg-open` process spawned, not
    whether a browser actually displayed anything, so it's not reliable as the
-   sole signal.
+   sole signal. The page asks you to confirm before it goes to the OIDC
+   provider.
 4. It polls `doneUrl` (honoring `Retry-After`) until you finish the OIDC
    provider's login page, then returns the token for the current request _and_
-   persists it to `$HOME/.yarnrc.yml` for future ones.
+   persists it to `$HOME/.yarnrc.yml` for future ones. The server allows 10
+   minutes from step 2 to the last poll.
 5. Concurrent requests (a cold `yarn install` fires many in parallel) share a
    single in-flight handshake rather than each opening their own browser tab.
 
 If a token was already configured but the registry rejects it as expired with a
-401, `wrapNetworkRequest` catches that specifically and redoes the same
-handshake before retrying the request once.
+401, `wrapNetworkRequest` catches that specifically, redoes the same handshake,
+and sends the request again once with the new token. Every later request in the
+same command uses the new token, so one install logs in once, not once per wave
+of requests.
+
+The plugin only acts for registries the configuration names
+(`npmRegistryServer`, `npmPublishRegistry`, `npmScopes.*`, `npmRegistries`); a
+401 from any other host is left alone. A registry with its own `npmAuthToken` or
+`npmAuthIdent` configured gets that credential from Yarn as usual, and the
+plugin only steps in if the registry refuses it. `loginUrl` must be an http(s)
+URL, and neither URL may be plain http when the registry is https. When a login
+can't finish (the server refused to start one, the 10 minutes ran out, or the
+URLs it returned were refused), the plugin prints why.
 
 ## Manual login
 
@@ -170,9 +183,10 @@ path here, by design:
   containerized shells) but without `CI` set. Set `CI=1` explicitly to get a
   fast, clear failure instead, then provision a token per the CI section above.
 - **Nothing happens, install just fails**: check whether the registry actually
-  implements `POST /-/v1/login` in the shape this plugin expects -- it silently
-  no-ops against any registry that doesn't, by design, so a misconfigured
-  `npmRegistryServer` pointing somewhere else will look like "the plugin isn't
-  doing anything" rather than an obvious error.
+  implements `POST /-/v1/login` in the shape this plugin expects. A registry
+  that answers it with 404 is taken to have no web login, without a message, and
+  isn't asked again in that command, so a misconfigured `npmRegistryServer`
+  pointing somewhere else will look like "the plugin isn't doing anything"
+  rather than an obvious error.
 - **Force a fresh login**: remove the relevant entry from `npmRegistries` in
   `$HOME/.yarnrc.yml` and re-run.

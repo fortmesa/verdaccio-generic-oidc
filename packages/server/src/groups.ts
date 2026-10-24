@@ -40,7 +40,10 @@ export interface GroupsLogger {
 /** roles === null means "membership only" -- the claim shape carries no per-role info to filter on. */
 type ExtractedGroups = Map<string, string[] | null>;
 
-function getByPath(claims: Record<string, unknown>, path: string): unknown {
+export function getByPath(
+  claims: Record<string, unknown>,
+  path: string,
+): unknown {
   return path
     .split('.')
     .reduce<unknown>(
@@ -104,11 +107,16 @@ function extractRawClaim(
   }
 
   if (typeof raw === 'object') {
+    // A key is a group only when its value says so: `true`, an array of
+    // roles, or an object holding one under mapRolesKey. Anything else,
+    // such as {"admin": false}, is not membership.
     const map: ExtractedGroups = new Map();
     for (const [name, value] of Object.entries(
       raw as Record<string, unknown>,
     )) {
-      if (Array.isArray(value)) {
+      if (value === true) {
+        map.set(name, null);
+      } else if (Array.isArray(value)) {
         map.set(name, value.map(String));
       } else if (
         value != null &&
@@ -121,8 +129,6 @@ function extractRawClaim(
             String,
           ),
         );
-      } else {
-        map.set(name, null);
       }
     }
     return map.size ? map : null;

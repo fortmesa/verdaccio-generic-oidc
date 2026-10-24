@@ -26,10 +26,9 @@ by Dan Lytkin, MIT licensed. This fork adds:
   public client, using PKCE (S256) instead of a secret to protect the code
   exchange -- for providers that support a secret-less public web client
   (Keycloak, Auth0, Okta, Authentik; not Google).
-- **In-memory session caching**: session lookups (which happen on every
-  authenticated request, not just logins) are cached for a bounded window
-  (`session.cacheTtl`, default 5 minutes) in front of whichever storage backend
-  is configured, cutting recurring Redis/DynamoDB load.
+- **`requiredClaims`**: claims an ID token must carry before a login gets a
+  token (for Google Workspace, `hd` and `email_verified`), so accounts outside
+  your organization can't log in even if the IdP lets them authenticate.
 - **Hardened, signed login request ids**: `/-/oidc/login`, `/-/oidc/callback`,
   and `/-/oidc/done` are necessarily unauthenticated, so upstream took its
   storage key straight from attacker-controlled input. This fork signs and
@@ -38,9 +37,16 @@ by Dan Lytkin, MIT licensed. This fork adds:
   rate-limits `/-/v1/login` itself (the endpoint that issues those ids), so the
   per-id budget can't be defeated by simply minting an unlimited number of
   legitimate ones.
+- **A login link can't be used against someone else**: `loginUrl` asks the
+  person to confirm before going to the IdP, the callback only accepts the
+  browser that started the login, `/-/oidc/done` hands the token out once, and
+  the login routes send no `Access-Control-Allow-Origin`. See the configuration
+  reference's "Login flow hardening".
+- **No server-side sessions**: a token's own signature and expiry are what's
+  checked, so authenticated requests never touch storage, and the only thing
+  stored is a finished login's token until the CLI picks it up.
 
-Compatible with Verdaccio 4.x, 5.x and 6.x (matches upstream; this fork adds
-features, it doesn't narrow compatibility).
+Tested with Verdaccio 6 (6.7.4 and 6.10.7). Needs Node.js 22.12 or later.
 
 ## Installation
 
@@ -218,17 +224,16 @@ config.
 
 ## Baking a storage backend into your own Docker image
 
-`ioredis`, `generic-pool`, `@aws-sdk/client-dynamodb`, and
-`@aws-sdk/lib-dynamodb` are optional peerDependencies, not regular dependencies
--- a plain install of this package will **not** pull them in, by design, so
-filesystem-only users don't get Redis or the AWS SDK forced on them. Neither
-Yarn nor npm auto-installs an optional peerDependency for the package that
-declares it (only for a _consumer_ that installs it explicitly), so building an
-image that wants all three backends baked in unconditionally takes an explicit
-step -- and Yarn specifically refuses to `add` a package that's already a
-peerDependency without special handling. See the worked, tested example and full
-explanation in [`Dockerfile`](Dockerfile) -- copy that pattern rather than
-reinventing it.
+`ioredis`, `@aws-sdk/client-dynamodb`, and `@aws-sdk/lib-dynamodb` are optional
+peerDependencies, not regular dependencies -- a plain install of this package
+will **not** pull them in, by design, so filesystem-only users don't get Redis
+or the AWS SDK forced on them. Neither Yarn nor npm auto-installs an optional
+peerDependency for the package that declares it (only for a _consumer_ that
+installs it explicitly), so building an image that wants all three backends
+baked in unconditionally takes an explicit step -- and Yarn specifically refuses
+to `add` a package that's already a peerDependency without special handling. See
+the worked, tested example and full explanation in [`Dockerfile`](Dockerfile) --
+copy that pattern rather than reinventing it.
 
 ## Local development / testing
 
@@ -247,20 +252,22 @@ both a realm role and a client role, matching `config.yaml`'s defaults.
 yarn workspace @fortmesa/verdaccio-generic-oidc test
 ```
 
-Requires Node `^20.19.0 || >=22.12.0` (see the repo root's `.nvmrc`) -- vitest's
-Rolldown-based bundler calls a `util.styleText()` form only available from those
-versions on, and crashes at startup on anything older.
+Requires Node 22.12 or later, the same floor as the package itself and vitest
+5's own.
 
 Every module has direct unit test coverage:
 
 - `src/groups.ts` -- every claim shape and filter outcome.
-- `src/loginRequestId.ts` -- signature forgery, age limits, use/mint budgets.
-- `src/cachedSession.ts` -- hit/miss/expiry/write-through behavior.
+- `src/loginRequestId.ts` -- signature forgery, re-spelled ids, age limits,
+  use/mint budgets, and the per-purpose secrets derived from an id.
 - `src/fs.ts`, `src/redis.ts`, `src/dynamo.ts` -- the three storage backends,
   each against a real (filesystem) or hand-rolled fake (Redis, DynamoDB) backing
-  store, covering round-trips, expiry, and `keyPrefix` isolation.
+  store, covering round-trips, single-read consume under concurrency, expiry,
+  and `keyPrefix` isolation.
 - `src/index.ts` -- the plugin itself, driven end-to-end through a real local
   HTTP server acting as a fake OIDC issuer (real RS256-signed ID tokens, real
-  JWKS, real discovery): the full login handshake for both confidential and PKCE
-  clients, the token-exchange endpoint, session authentication, and rejection of
-  forged login request ids.
+  JWKS, real discovery, a PKCE check, nonce echoing): the full login handshake
+  for confidential and PKCE clients, the confirmation page, browser binding,
+  single-read `doneUrl`, CORS removal, `requiredClaims`, the token-exchange
+  endpoint's gating and rate limit, and the bearer/Basic middleware
+  (generated-token keys, request pausing, clock tolerance).

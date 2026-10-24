@@ -75,10 +75,28 @@ const http = require('node:http');
 const os = require('node:os');
 const fs = require('node:fs');
 const path = require('node:path');
-const {execFile} = require('node:child_process');
+const crypto = require('node:crypto');
+const {execFile, execFileSync} = require('node:child_process');
 const {promisify} = require('node:util');
 
 const execFileAsync = promisify(execFile);
+
+// Every yarn this test runs gets its own HOME, so none of them reads the
+// real ~/.yarnrc.yml (registry credentials, settings an older Yarn
+// rejects) and nothing the plugin persists lands there. COREPACK_HOME stays
+// put, so the already-downloaded Yarn releases are reused.
+function isolatedEnv(extra = {}) {
+  const env = {
+    ...process.env,
+    HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'oidc-login-home-')),
+    COREPACK_HOME:
+      process.env.COREPACK_HOME ||
+      path.join(os.homedir(), '.cache', 'node', 'corepack'),
+    ...extra,
+  };
+  delete env.CI;
+  return env;
+}
 
 const PLUGIN_BUNDLE = path.join(
   __dirname,
@@ -93,7 +111,7 @@ const TEST_VERSION = '3.0.1';
 
 const YARN_VERSIONS = [
   {version: '3.8.7', major: 3},
-  {version: '4.17.0', major: 4},
+  {version: '4.18.1', major: 4},
 ];
 
 // Every `yarn npm` subcommand that actually touches the registry was
@@ -137,8 +155,7 @@ function startFake401Server() {
   });
 }
 
-async function runYarn(yarnVersion, projectDir, args, extraEnv) {
-  const env = {...process.env, ...extraEnv};
+async function runYarn(yarnVersion, projectDir, args, env) {
   try {
     const {stdout, stderr} = await execFileAsync(
       'corepack',
@@ -205,6 +222,129 @@ function toYaml(obj, indent = 0) {
   return lines.join('\n');
 }
 
+// Scenario C: a registry that implements the web-login handshake and only
+// accepts the token it issues. loginUrl stands in for the browser page:
+// requesting it completes the login, which the fake xdg-open below does.
+// Every metadata and tarball request needs `Bearer fresh-token`.
+function startFakeLoginRegistry(packages) {
+  const requests = [];
+  const completed = new Set();
+  let logins = 0;
+  const server = http.createServer((req, res) => {
+    requests.push({method: req.method, url: req.url});
+    const base = `http://127.0.0.1:${server.address().port}`;
+    const json = (status, body) => {
+      res.writeHead(status, {'content-type': 'application/json'});
+      res.end(JSON.stringify(body));
+    };
+
+    if (req.method === 'POST' && req.url === '/-/v1/login') {
+      logins += 1;
+      const id = String(logins);
+      return json(200, {
+        loginUrl: `${base}/-/fake/login/${id}`,
+        doneUrl: `${base}/-/fake/done/${id}`,
+      });
+    }
+    const login = /^\/-\/fake\/login\/(\d+)$/.exec(req.url);
+    if (login) {
+      completed.add(login[1]);
+      return json(200, {});
+    }
+    const done = /^\/-\/fake\/done\/(\d+)$/.exec(req.url);
+    if (done) {
+      return completed.has(done[1])
+        ? json(200, {token: 'fresh-token'})
+        : json(202, {});
+    }
+
+    if (req.headers.authorization !== 'Bearer fresh-token') {
+      return json(401, {error: 'unauthorized'});
+    }
+    for (const pkg of packages) {
+      if (req.url === `/${pkg.name}`) {
+        return json(200, {
+          name: pkg.name,
+          'dist-tags': {latest: pkg.version},
+          // Old enough for Yarn's default npmMinimalAgeGate.
+          time: {
+            created: '2020-01-01T00:00:00.000Z',
+            modified: '2020-01-01T00:00:00.000Z',
+            [pkg.version]: '2020-01-01T00:00:00.000Z',
+          },
+          versions: {
+            [pkg.version]: {
+              name: pkg.name,
+              version: pkg.version,
+              dist: {
+                tarball: `${base}/${pkg.name}/-/${pkg.name}-${pkg.version}.tgz`,
+                shasum: pkg.shasum,
+                integrity: pkg.integrity,
+              },
+            },
+          },
+        });
+      }
+      if (req.url === `/${pkg.name}/-/${pkg.name}-${pkg.version}.tgz`) {
+        res.writeHead(200, {'content-type': 'application/octet-stream'});
+        return res.end(pkg.tarball);
+      }
+    }
+    json(404, {error: 'not found'});
+  });
+  return new Promise(resolve => {
+    server.listen(0, '127.0.0.1', () =>
+      resolve({server, requests, loginCount: () => logins}),
+    );
+  });
+}
+
+function makeFakePackage(name, version) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oidc-login-pkg-'));
+  try {
+    fs.mkdirSync(path.join(dir, 'package'));
+    fs.writeFileSync(
+      path.join(dir, 'package', 'package.json'),
+      JSON.stringify({name, version}),
+    );
+    execFileSync('tar', [
+      'czf',
+      path.join(dir, 'out.tgz'),
+      '-C',
+      dir,
+      'package',
+    ]);
+    const tarball = fs.readFileSync(path.join(dir, 'out.tgz'));
+    return {
+      name,
+      version,
+      tarball,
+      shasum: crypto.createHash('sha1').update(tarball).digest('hex'),
+      integrity: `sha512-${crypto.createHash('sha512').update(tarball).digest('base64')}`,
+    };
+  } finally {
+    fs.rmSync(dir, {recursive: true, force: true});
+  }
+}
+
+// The plugin only logs in from a terminal (process.stdout.isTTY, no CI), so
+// yarn runs under script(1) for a pseudo-terminal.
+async function runYarnInTerminal(yarnVersion, projectDir, args, env) {
+  const command = ['corepack', `yarn@${yarnVersion}`, ...args]
+    .map(arg => `'${arg.replace(/'/g, "'\\''")}'`)
+    .join(' ');
+  try {
+    const {stdout} = await execFileAsync(
+      'script',
+      ['-q', '-e', '-c', command, '/dev/null'],
+      {cwd: projectDir, env, encoding: 'utf8'},
+    );
+    return {ok: true, output: stdout};
+  } catch (err) {
+    return {ok: false, output: (err.stdout || '') + (err.stderr || '')};
+  }
+}
+
 async function main() {
   let passed = 0;
 
@@ -243,15 +383,12 @@ async function main() {
           writeProjectFiles(projectDir, version, registryUrl, {
             withStaleToken: false,
           });
+          const env = isolatedEnv({YARN_GLOBAL_FOLDER: globalFolder});
 
           await execFileAsync(
             'corepack',
             ['yarn@' + version, 'plugin', 'import', PLUGIN_BUNDLE],
-            {
-              cwd: projectDir,
-              env: {...process.env, YARN_GLOBAL_FOLDER: globalFolder},
-              encoding: 'utf8',
-            },
+            {cwd: projectDir, env, encoding: 'utf8'},
           );
 
           const start = Date.now();
@@ -259,10 +396,7 @@ async function main() {
             version,
             projectDir,
             ['add', `${TEST_PACKAGE}@${TEST_VERSION}`],
-            {
-              YARN_GLOBAL_FOLDER: globalFolder,
-              CI: '1',
-            },
+            {...env, CI: '1'},
           );
           const elapsedMs = Date.now() - start;
 
@@ -321,15 +455,12 @@ async function main() {
             writeProjectFiles(projectDir, version, registryUrl, {
               withStaleToken: true,
             });
+            const env = isolatedEnv({YARN_GLOBAL_FOLDER: globalFolder});
 
             await execFileAsync(
               'corepack',
               ['yarn@' + version, 'plugin', 'import', PLUGIN_BUNDLE],
-              {
-                cwd: projectDir,
-                env: {...process.env, YARN_GLOBAL_FOLDER: globalFolder},
-                encoding: 'utf8',
-              },
+              {cwd: projectDir, env, encoding: 'utf8'},
             );
 
             if (needsInstall) {
@@ -345,9 +476,7 @@ async function main() {
                 version,
                 projectDir,
                 ['install'],
-                {
-                  YARN_GLOBAL_FOLDER: globalFolder,
-                },
+                env,
               );
               assert.equal(
                 installResult.ok,
@@ -359,7 +488,7 @@ async function main() {
 
             const start = Date.now();
             const result = await runYarn(version, projectDir, args, {
-              YARN_GLOBAL_FOLDER: globalFolder,
+              ...env,
               CI: '1',
             });
             const elapsedMs = Date.now() - start;
@@ -398,6 +527,87 @@ async function main() {
         },
       );
     }
+  }
+
+  const fakePackages = [
+    makeFakePackage('fake-dep-a', '1.0.0'),
+    makeFakePackage('fake-dep-b', '1.0.0'),
+  ];
+  for (const {version, major} of YARN_VERSIONS) {
+    await check(
+      `yarn ${version} (major ${major}): a stale token in a terminal logs in once, and the install succeeds through metadata and tarball requests`,
+      async () => {
+        const {server, requests, loginCount} =
+          await startFakeLoginRegistry(fakePackages);
+        const registryUrl = `http://127.0.0.1:${server.address().port}`;
+        const projectDir = fs.mkdtempSync(
+          path.join(os.tmpdir(), `oidc-login-cli-${major}-`),
+        );
+        const globalFolder = fs.mkdtempSync(
+          path.join(os.tmpdir(), `oidc-login-global-${major}-`),
+        );
+        const fakeBin = fs.mkdtempSync(
+          path.join(os.tmpdir(), 'oidc-login-bin-'),
+        );
+        fs.writeFileSync(
+          path.join(fakeBin, 'xdg-open'),
+          `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} -e 'fetch(process.argv[1]).then(r => r.text())' "$1"\n`,
+          {mode: 0o755},
+        );
+        const env = isolatedEnv({
+          PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
+          YARN_GLOBAL_FOLDER: globalFolder,
+        });
+        // The plugin saves the new token to $HOME/.yarnrc.yml.
+        const home = env.HOME;
+        try {
+          writeProjectFiles(projectDir, version, registryUrl, {
+            withStaleToken: true,
+          });
+          await execFileAsync(
+            'corepack',
+            ['yarn@' + version, 'plugin', 'import', PLUGIN_BUNDLE],
+            {cwd: projectDir, env, encoding: 'utf8'},
+          );
+
+          const result = await runYarnInTerminal(
+            version,
+            projectDir,
+            ['add', 'fake-dep-a@1.0.0', 'fake-dep-b@1.0.0'],
+            env,
+          );
+
+          assert.equal(
+            result.ok,
+            true,
+            `expected the add to succeed after logging in on yarn ${version}:\n${result.output}`,
+          );
+          for (const pkg of fakePackages) {
+            assert.ok(
+              fs.existsSync(
+                path.join(projectDir, 'node_modules', pkg.name, 'package.json'),
+              ),
+              `${pkg.name} should be installed on yarn ${version}`,
+            );
+          }
+          assert.equal(
+            loginCount(),
+            1,
+            `expected exactly one login for the whole install on yarn ${version}, saw ${loginCount()}: ${JSON.stringify(requests)}`,
+          );
+          assert.match(
+            fs.readFileSync(path.join(home, '.yarnrc.yml'), 'utf8'),
+            /fresh-token/,
+            `the new token should be saved to $HOME/.yarnrc.yml on yarn ${version}`,
+          );
+        } finally {
+          server.close();
+          for (const dir of [projectDir, globalFolder, home, fakeBin]) {
+            fs.rmSync(dir, {recursive: true, force: true});
+          }
+        }
+      },
+    );
   }
 
   console.log(`\n${passed} check(s) passed.`);

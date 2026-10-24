@@ -43,13 +43,13 @@ a user's project already uses (npm, yarn, pnpm) -- the workspace setup here only
 affects how _this repo_ is developed, not how the published package is
 installed.
 
-The root `devDependencies` (`ioredis`, `generic-pool`, `@aws-sdk/*`) exist
-purely so a fresh `yarn install` here gives local `tsc`/vitest something to
-resolve types against -- `packages/server` declares these as _optional
-peerDependencies_ (real consumers opt in to whichever storage backend they use),
-which neither Yarn nor npm auto-installs for the package that declares them.
-This root is private and never published, so there's no consumer-facing
-consequence to it also listing them as devDependencies.
+The root `devDependencies` (`ioredis`, `@aws-sdk/*`) exist purely so a fresh
+`yarn install` here gives local `tsc`/vitest something to resolve types against
+-- `packages/server` declares these as _optional peerDependencies_ (real
+consumers opt in to whichever storage backend they use), which neither Yarn nor
+npm auto-installs for the package that declares them. This root is private and
+never published, so there's no consumer-facing consequence to it also listing
+them as devDependencies.
 
 ## Documentation
 

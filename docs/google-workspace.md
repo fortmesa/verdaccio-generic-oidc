@@ -41,10 +41,15 @@ auth:
     # default) -- use `email` instead, or usernameClaim resolution will
     # throw "Missing username claim 'preferred_username'" on every login.
     usernameClaim: email
+    # Only verified accounts on your Workspace domain get a token, whatever
+    # the OAuth consent screen allows. See "Restricting who can log in" in
+    # configuration.md.
+    requiredClaims:
+      hd: example.com
+      email_verified: true
 
     filesystem:
-      sessionPath: /tmp
-      tokenPath: /tmp
+      tokenPath: /var/lib/verdaccio/oidc-tokens
 ```
 
 ## 3. Google-specific limitation: there is no real "groups" claim
@@ -85,5 +90,7 @@ packages:
 This restricts access to your Workspace domain -- it is not per-user or per-team
 authorization, just "is this a real account on our domain." Personal Google
 accounts have no `hd` claim at all, so they extract no groups and fail this
-check by default. For real group-based access control with Google, layer the
-Admin SDK integration mentioned above on top of (not instead of) this plugin.
+check by default. They can still log in and get `$authenticated`, though, unless
+`requiredClaims` (in the config above) turns them away at login. For real
+group-based access control with Google, layer the Admin SDK integration
+mentioned above on top of (not instead of) this plugin.

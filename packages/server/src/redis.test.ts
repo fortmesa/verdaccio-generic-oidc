@@ -2,60 +2,45 @@
  * Fakes ioredis at the client-class level (matching this repo's storage
  * backends: real logic, hand-rolled fake I/O, no real Redis server needed)
  * with a store shared across every `new Redis()` instance created during a
- * test -- this backend creates a second, pooled connection purely for the
- * blocking XREAD call, and a real Redis deployment would have both
- * connections see the same server-side data.
+ * test, the way a real Redis deployment is one server however many
+ * connections reach it. The fake's MULTI runs its queued commands back to
+ * back with nothing in between, as Redis runs a transaction.
  */
 import {describe, it, expect, vi, beforeEach} from 'vitest';
 
-type StreamEntry = [string, [string, string]];
-type FakeEntry =
-  {type: 'string'; value: string} | {type: 'stream'; entries: StreamEntry[]};
+type FakeEntry = {value: string; ttlSec: number};
 
 let store: Map<string, FakeEntry>;
 
 vi.mock('ioredis', () => {
-  class FakeRedis {
-    async connect() {}
-    async quit() {}
+  class FakeMulti {
+    private ops: Array<() => unknown> = [];
+    get(key: string) {
+      this.ops.push(() => store.get(key)?.value ?? null);
+      return this;
+    }
+    del(key: string) {
+      this.ops.push(() => (store.delete(key) ? 1 : 0));
+      return this;
+    }
+    async exec() {
+      return this.ops.map(op => [null, op()]);
+    }
+  }
 
-    async set(key: string, value: string, _mode: string, _ttl: number) {
-      store.set(key, {type: 'string', value});
+  class FakeRedis {
+    async quit() {
       return 'OK';
     }
 
-    async get(key: string) {
-      const entry = store.get(key);
-      return entry?.type === 'string' ? entry.value : null;
+    async set(key: string, value: string, mode: string, ttlSec: number) {
+      if (mode !== 'EX') throw new Error(`unexpected SET mode ${mode}`);
+      store.set(key, {value, ttlSec});
+      return 'OK';
     }
 
-    async xadd(key: string, _id: string, field: string, value: string) {
-      let entry = store.get(key);
-      if (entry?.type !== 'stream') {
-        entry = {type: 'stream', entries: []};
-        store.set(key, entry);
-      }
-      const id = `${entry.entries.length}-0`;
-      entry.entries.push([id, [field, value]]);
-      return id;
-    }
-
-    async expire(_key: string, _ttl: number) {
-      return 1;
-    }
-
-    async xread(
-      _block: string,
-      _timeoutMs: number,
-      _streamsKw: string,
-      key: string,
-      _cursor: string,
-    ) {
-      const entry = store.get(key);
-      if (entry?.type === 'stream' && entry.entries.length > 0) {
-        return [[key, entry.entries]];
-      }
-      return null;
+    multi() {
+      return new FakeMulti();
     }
   }
 
@@ -63,61 +48,55 @@ vi.mock('ioredis', () => {
 });
 
 import {NewRedisStorage} from './redis';
-import {TokenSet} from 'openid-client';
 
 beforeEach(() => {
   store = new Map();
 });
 
-describe('NewRedisStorage: session storage', () => {
-  it('round-trips a session through set() and get()', async () => {
-    const {ss} = NewRedisStorage({url: 'redis://fake'});
-    const tokenSet = new TokenSet({access_token: 'abc'});
-
-    await ss.set('session:1', tokenSet, 300);
-    const result = await ss.get('session:1');
-
-    expect(result).toEqual({access_token: 'abc'});
-  });
-
-  it('returns null for a session that was never set', async () => {
-    const {ss} = NewRedisStorage({url: 'redis://fake'});
-    expect(await ss.get('session:missing')).toBeNull();
-  });
-
-  it('namespaces keys with keyPrefix, isolating same-name keys', async () => {
-    const a = NewRedisStorage({url: 'redis://fake', keyPrefix: 'a-'});
-    const b = NewRedisStorage({url: 'redis://fake', keyPrefix: 'b-'});
-
-    await a.ss.set('session:1', new TokenSet({access_token: 'a-token'}), 300);
-    await b.ss.set('session:1', new TokenSet({access_token: 'b-token'}), 300);
-
-    expect(await a.ss.get('session:1')).toEqual({access_token: 'a-token'});
-    expect(await b.ss.get('session:1')).toEqual({access_token: 'b-token'});
-    expect(store.has('a-session:1')).toBe(true);
-    expect(store.has('b-session:1')).toBe(true);
-  });
-
-  it('defaults to no prefix when keyPrefix is omitted', async () => {
-    const {ss} = NewRedisStorage({url: 'redis://fake'});
-    await ss.set('session:1', new TokenSet({access_token: 'abc'}), 300);
-    expect(store.has('session:1')).toBe(true);
-  });
-});
-
 describe('NewRedisStorage: token storage', () => {
-  it('round-trips a token through set() and get()', async () => {
+  it('round-trips a token through set() and consume(), with the expiry set in the same command', async () => {
     const {ts} = NewRedisStorage({url: 'redis://fake'});
 
     await ts.set('login:1', 'npm-token-value', 300);
-    const result = await ts.get('login:1', 5);
+    expect(store.get('login:1')).toEqual({
+      value: 'npm-token-value',
+      ttlSec: 300,
+    });
+    expect(await ts.consume('login:1', 1)).toBe('npm-token-value');
+  });
 
-    expect(result).toBe('npm-token-value');
+  it('hands a value out once: consume() deletes it', async () => {
+    const {ts} = NewRedisStorage({url: 'redis://fake'});
+
+    await ts.set('login:1', 'npm-token-value', 300);
+    expect(await ts.consume('login:1', 1)).toBe('npm-token-value');
+    expect(store.has('login:1')).toBe(false);
+    expect(await ts.consume('login:1', 0.2)).toBeNull();
+  });
+
+  it('gives the value to exactly one of several concurrent consumers', async () => {
+    const {ts} = NewRedisStorage({url: 'redis://fake'});
+
+    await ts.set('login:1', 'npm-token-value', 300);
+    const results = await Promise.all(
+      Array.from({length: 8}, () => ts.consume('login:1', 0.2)),
+    );
+    expect(results.filter(r => r === 'npm-token-value')).toHaveLength(1);
+  });
+
+  it('polls and picks up a value written shortly after consume() starts', async () => {
+    const {ts} = NewRedisStorage({url: 'redis://fake'});
+
+    const pending = ts.consume('login:1', 2);
+    await new Promise(r => setTimeout(r, 100));
+    await ts.set('login:1', 'late-token', 300);
+
+    expect(await pending).toBe('late-token');
   });
 
   it('returns null when polling a token that was never set', async () => {
     const {ts} = NewRedisStorage({url: 'redis://fake'});
-    expect(await ts.get('login:missing', 5)).toBeNull();
+    expect(await ts.consume('login:missing', 0.2)).toBeNull();
   });
 
   it('namespaces keys with keyPrefix, isolating same-name keys', async () => {
@@ -127,15 +106,17 @@ describe('NewRedisStorage: token storage', () => {
     await a.ts.set('login:1', 'a-token', 300);
     await b.ts.set('login:1', 'b-token', 300);
 
-    expect(await a.ts.get('login:1', 5)).toBe('a-token');
-    expect(await b.ts.get('login:1', 5)).toBe('b-token');
+    expect(store.has('a-login:1')).toBe(true);
+    expect(store.has('b-login:1')).toBe(true);
+    expect(await a.ts.consume('login:1', 1)).toBe('a-token');
+    expect(await b.ts.consume('login:1', 1)).toBe('b-token');
   });
 });
 
 describe('NewRedisStorage: close()', () => {
-  it('closes both session and token storage without throwing', async () => {
-    const {ss, ts} = NewRedisStorage({url: 'redis://fake'});
-    await expect(ss.close()).resolves.toBeUndefined();
+  it('closes without throwing, and a second close is a no-op', async () => {
+    const {ts} = NewRedisStorage({url: 'redis://fake'});
+    await expect(ts.close()).resolves.toBeUndefined();
     await expect(ts.close()).resolves.toBeUndefined();
   });
 });

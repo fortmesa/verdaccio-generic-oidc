@@ -1,23 +1,19 @@
-import {
-  IBasicAuth,
-  IPluginMiddleware,
-  IPluginAuth,
-  AuthCallback,
-  PluginOptions,
+import type {pluginUtils} from '@verdaccio/core';
+import type {
+  Config,
+  JWTSignOptions,
   Logger,
   RemoteUser,
-  JWTSignOptions,
 } from '@verdaccio/types';
 import {Issuer, Client, TokenSet, generators} from 'openid-client';
-import asyncRetry = require('async-retry');
-import * as express from 'express';
-import {Express, Response} from 'express';
-import {nanoid} from 'nanoid/async';
-import ms = require('ms');
+import * as bodyParser from 'body-parser';
+import type {Express, NextFunction, Request, Response} from 'express';
 import * as jwt from 'jsonwebtoken';
+import {randomBytes, timingSafeEqual} from 'crypto';
+import {setTimeout as sleep} from 'timers/promises';
 import {URL} from 'url';
 
-import {ISessionStorage, ITokenStorage} from './types';
+import {ITokenStorage} from './types';
 import type {
   NewRedisStorage as NewRedisStorageType,
   RedisStorageConfig,
@@ -27,13 +23,23 @@ import type {
   NewDynamoStorage as NewDynamoStorageType,
   DynamoStorageConfig,
 } from './dynamo';
-import {extractGroups, RolesAllowList} from './groups';
-import {NewCachedSessionStorage} from './cachedSession';
+import {extractGroups, getByPath, RolesAllowList} from './groups';
 import {
   signLoginRequestId,
   verifyAndConsumeLoginRequestId,
   checkAndConsumeMintBudget,
+  createSourceBudget,
+  loginRequestSecret,
+  MAX_AGE_SEC,
 } from './loginRequestId';
+
+type ClaimValue = string | number | boolean;
+
+type PluginOptions = pluginUtils.PluginOptions;
+type AuthCallback = pluginUtils.AuthCallback;
+// What Verdaccio passes as `auth`: its Auth instance, whose config (and the
+// instance secret in it) the IBasicAuth type leaves out.
+type VerdaccioAuth = pluginUtils.IBasicAuth & {config: Config};
 
 type OidcPluginConfig = {
   publicUrl: string;
@@ -50,19 +56,20 @@ type OidcPluginConfig = {
     mapKey?: string;
     allowList?: string | RolesAllowList;
   };
+  // Claims an ID token must carry before a login is accepted: each key is a
+  // dot-path into the claims, each value the allowed value or a list of
+  // them. See docs/configuration.md, "Restricting who can log in".
+  requiredClaims?: Record<string, ClaimValue | ClaimValue[]>;
 
   // Exactly one of these three is required -- see docs/configuration.md,
   // "Storage backends".
   redis?: RedisStorageConfig;
-  filesystem?: {sessionPath: string; tokenPath: string};
+  // sessionPath is no longer read; only tokenPath is.
+  filesystem?: {sessionPath?: string; tokenPath: string};
   dynamo?: DynamoStorageConfig;
 
-  session?: {
-    // How long a session lookup is trusted from an in-memory cache before
-    // re-checking the real storage backend, in seconds. Defaults to 5
-    // minutes; set to 0 to disable caching entirely. See cachedSession.ts.
-    cacheTtl?: number;
-  };
+  // No longer read: there is no session store to cache.
+  session?: {cacheTtl?: number};
 
   accessTokenAuth?: boolean;
 
@@ -74,9 +81,25 @@ type Tokens = {
   webToken: string;
 };
 
-type RemoteUserEx = RemoteUser & {sid: string};
+// A generated token's key, as Verdaccio's own `npm token create` writes it
+// into the JWT and its router reads it from req.remote_user.
+type RemoteUserEx = RemoteUser & {token?: {key: string}};
 
 const TOKEN_BEARER = 'Bearer';
+const TOKEN_EXCHANGE_GRANT = 'urn:ietf:params:oauth:grant-type:token-exchange';
+
+// Verdaccio's own defaults for its rate-limited user routes
+// (@verdaccio/config's defaultUserRateLimiting), used for token exchange
+// attempts when the deployment sets no userRateLimit of its own.
+const DEFAULT_USER_RATE_LIMIT = {windowMs: 15 * 60 * 1000, max: 1000};
+
+// Neither Verdaccio's default `security` nor every deployment sets
+// api.jwt.sign.expiresIn, and jsonwebtoken rejects an undefined one.
+const DEFAULT_TOKEN_EXPIRES_IN = '7d';
+
+// Tokens are minted on one replica and checked on another; this absorbs
+// clock skew between them unless security.api.jwt.verify sets its own.
+const DEFAULT_CLOCK_TOLERANCE_SEC = 30;
 
 // Must match this package's name: Verdaccio's plugin loader resolves a scoped
 // package name verbatim as the config key (no `verdaccio-` prefix mangling),
@@ -85,34 +108,41 @@ const TOKEN_BEARER = 'Bearer';
 const PLUGIN_CONFIG_KEY = '@fortmesa/verdaccio-generic-oidc';
 
 export default class OidcPlugin
-  implements IPluginAuth<OidcPluginConfig>, IPluginMiddleware<OidcPluginConfig>
+  implements
+    Pick<pluginUtils.Auth<OidcPluginConfig>, 'authenticate'>,
+    Pick<
+      pluginUtils.ExpressMiddleware<OidcPluginConfig, unknown, VerdaccioAuth>,
+      'register_middlewares'
+    >
 {
   private readonly pluginName = PLUGIN_CONFIG_KEY;
 
   private config: OidcPluginConfig;
-  private options: PluginOptions<OidcPluginConfig>;
+  private options: PluginOptions;
   private clientPromise!: Promise<Client>;
+  // Set once discovery succeeds, so a route that must not wait on a
+  // discovery still being retried (PUT /-/user) can check it directly.
+  private client?: Client;
   private closed = false;
   private logger!: Logger;
-  private ss!: ISessionStorage;
   private ts!: ITokenStorage;
-  private sessionTtl!: number;
   private usePkce!: boolean;
+  private requiredClaims!: Array<[string, ClaimValue[]]>;
+  private exchangeBudget!: {take(source: string): boolean};
   // Captured from register_middlewares() below -- apiJWTmiddleware(helpers)
   // only receives the narrow {createAnonymousRemoteUser, createRemoteUser}
   // helpers, not this. Needed to delegate Basic-Auth-scheme requests (e.g.
   // htpasswd, or a static CI credential) to the *real*, multi-plugin auth
-  // chain instead of only ever checking this plugin's own OIDC sessions.
-  private authChain?: IBasicAuth<OidcPluginConfig>;
+  // chain.
+  private authChain?: VerdaccioAuth;
 
-  constructor(
-    config: OidcPluginConfig,
-    appOptions: PluginOptions<OidcPluginConfig>,
-  ) {
+  constructor(config: OidcPluginConfig, appOptions: PluginOptions) {
     this.config = config;
     this.options = appOptions;
+    // The middleware-role instance is constructed with the config section
+    // set below, so the auth-role instance is right there in it.
     if (this.config.oidcPluginInstance != null) {
-      return this.options.config.oidcPluginInstance;
+      return this.config.oidcPluginInstance;
     }
 
     this.options.config.middlewares = {
@@ -126,21 +156,16 @@ export default class OidcPlugin
       '@{pluginName} in jwt mode',
     );
     this.apiJWTmiddleware = this._apiJWTmiddleware;
-    const sessionExpiresIn =
-      this.options.config.security?.api?.jwt?.sign?.expiresIn;
-    const sessionTtl =
-      sessionExpiresIn == null || sessionExpiresIn === 'never'
-        ? '30d'
-        : sessionExpiresIn;
-    // ISessionStorage.set()'s expires_sec is, per its name, seconds -- but
-    // ms() (needed for a human duration string like '30d') returns
-    // milliseconds. A numeric expiresIn is already seconds by JWT's own
-    // convention, so only the string branch needs converting. Getting this
-    // wrong here previously meant sessions effectively never expired in
-    // Redis/DynamoDB/filesystem (a 30d config value became ~82 years).
-    this.sessionTtl = Number.isNaN(+sessionTtl)
-      ? Math.floor(ms(sessionTtl) / 1000)
-      : +sessionTtl;
+    this.requiredClaims = normalizeRequiredClaims(this.config.requiredClaims);
+
+    const userRateLimit = {
+      ...DEFAULT_USER_RATE_LIMIT,
+      ...(this.options.config as {userRateLimit?: object}).userRateLimit,
+    } as {windowMs: number; max: number};
+    this.exchangeBudget = createSourceBudget(
+      userRateLimit.max,
+      Math.ceil(userRateLimit.windowMs / 1000),
+    );
 
     if (this.config.redis?.url) {
       // ioredis is an optional peer dependency -- only require() it when
@@ -150,72 +175,73 @@ export default class OidcPlugin
       const {NewRedisStorage} = require('./redis') as {
         NewRedisStorage: typeof NewRedisStorageType;
       };
-      const rs = NewRedisStorage(this.config.redis);
-      this.ss = rs.ss;
-      this.ts = rs.ts;
-    } else if (
-      this.config.filesystem?.sessionPath &&
-      this.config.filesystem?.tokenPath
-    ) {
-      const rs = NewFileStorage(
+      this.ts = NewRedisStorage(this.config.redis).ts;
+    } else if (this.config.filesystem?.tokenPath) {
+      this.ts = NewFileStorage(
         this.logger,
-        this.config.filesystem.sessionPath,
         this.config.filesystem.tokenPath,
-      );
-      this.ss = rs.ss;
-      this.ts = rs.ts;
+      ).ts;
     } else if (this.config.dynamo?.tableName) {
       // @aws-sdk/* is an optional peer dependency -- same reasoning as above.
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const {NewDynamoStorage} = require('./dynamo') as {
         NewDynamoStorage: typeof NewDynamoStorageType;
       };
-      const rs = NewDynamoStorage(this.config.dynamo);
-      this.ss = rs.ss;
-      this.ts = rs.ts;
+      this.ts = NewDynamoStorage(this.config.dynamo).ts;
     } else {
       throw new Error(
-        'invalid configuration: none of [redis.url], [filesystem.sessionPath, filesystem.tokenPath], or [dynamo.tableName] is set',
+        'invalid configuration: none of [redis.url], [filesystem.tokenPath], or [dynamo.tableName] is set',
       );
     }
-
-    // authenticate() calls ss.get() on every authenticated npm/yarn request,
-    // not just logins -- wrapping whichever backend was selected above with
-    // a bounded-staleness in-memory cache applies uniformly regardless of
-    // which one is in use. session.cacheTtl: 0 opts out entirely.
-    const sessionCacheTtlSec = this.config.session?.cacheTtl ?? 5 * 60;
-    if (sessionCacheTtlSec > 0) {
-      this.ss = NewCachedSessionStorage(this.ss, sessionCacheTtlSec);
+    if (this.config.filesystem?.sessionPath != null) {
+      this.logger.warn({}, 'filesystem.sessionPath is no longer used');
+    }
+    if (this.config.session != null) {
+      this.logger.warn({}, 'session.cacheTtl is no longer used');
     }
 
     const clientSecret =
       process.env.OIDC_CLIENT_SECRET || this.config.clientSecret;
     this.usePkce = !clientSecret;
 
-    this.clientPromise = asyncRetry(() => Issuer.discover(this.config.issuer), {
-      forever: true,
-      maxTimeout: 30_000,
-      onRetry: (err, attempt) => {
+    this.clientPromise = this.discoverIssuer().then(issuer => {
+      const client = new issuer.Client({
+        client_id: process.env.OIDC_CLIENT_ID || this.config.clientId,
+        // No secret configured -> public client, authenticated via PKCE
+        // (see the /-/oidc/login and /-/oidc/callback handlers) instead.
+        ...(clientSecret
+          ? {client_secret: clientSecret}
+          : {token_endpoint_auth_method: 'none'}),
+        redirect_uris: [
+          new URL('-/oidc/callback', this.config.publicUrl).toString(),
+        ],
+        response_types: ['code'],
+      });
+      this.client = client;
+      return client;
+    });
+    // Rejects only after close(); every route that awaits it has its own
+    // handler, so don't let it surface as an unhandled rejection.
+    this.clientPromise.catch(() => undefined);
+  }
+
+  // Retries until it succeeds or close() is called, waiting 1s, 2s, 4s and
+  // so on between attempts, capped at 30s.
+  private async discoverIssuer(): Promise<Issuer> {
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await Issuer.discover(this.config.issuer);
+      } catch (err) {
+        if (this.closed) throw err;
         this.logger.warn(
           {err, attempt},
           'Failed to discover issuer, retrying [@{attempt}]: @{!err.message}\n@{err.stack}',
         );
-      },
-    }).then(
-      issuer =>
-        new issuer.Client({
-          client_id: process.env.OIDC_CLIENT_ID || this.config.clientId,
-          // No secret configured -> public client, authenticated via PKCE
-          // (see the /-/oidc/login and /-/oidc/callback handlers) instead.
-          ...(clientSecret
-            ? {client_secret: clientSecret}
-            : {token_endpoint_auth_method: 'none'}),
-          redirect_uris: [
-            new URL('-/oidc/callback', this.config.publicUrl).toString(),
-          ],
-          response_types: ['code'],
-        }),
-    );
+        await sleep(Math.min(1000 * 2 ** (attempt - 1), 30_000), undefined, {
+          ref: false,
+        });
+      }
+    }
   }
 
   public close() {
@@ -225,7 +251,6 @@ export default class OidcPlugin
     }
 
     plugin.closed = true;
-    plugin.ss.close();
     plugin.ts.close();
   }
 
@@ -262,68 +287,34 @@ export default class OidcPlugin
     return extractGroups(tokenSet.claims(), plugin.config, plugin.logger);
   }
 
-  private async saveSession(
-    sessionId: string,
-    tokenSet: TokenSet,
-  ): Promise<void> {
+  // The first requiredClaims entry the token doesn't satisfy, or null. A
+  // claim satisfies an entry when it equals one allowed value, or, for an
+  // array claim, when any element does. Values compare with ===, so `true`
+  // and "true" are different.
+  private unmetRequiredClaim(tokenSet: TokenSet): string | null {
     const plugin = this.getInstance();
-    return plugin.ss.set(`session:${sessionId}`, tokenSet, plugin.sessionTtl);
+    const claims = tokenSet.claims() as Record<string, unknown>;
+    for (const [claimPath, allowed] of plugin.requiredClaims) {
+      const actual = getByPath(claims, claimPath);
+      const values = Array.isArray(actual) ? actual : [actual];
+      if (!values.some(value => allowed.includes(value as ClaimValue))) {
+        return claimPath;
+      }
+    }
+    return null;
   }
 
-  public authenticate(user: string, password: string, cb: AuthCallback): void {
-    const plugin = this.getInstance();
-
-    Promise.resolve()
-      .then(async () => {
-        const sessionId = password;
-        const tokenSetObj: any | null = await plugin.ss.get(
-          `session:${sessionId}`,
-        );
-        if (tokenSetObj == null) {
-          cb(null, false);
-          return;
-        }
-
-        let tokenSet = new TokenSet(tokenSetObj);
-        const username = this.getUsername(tokenSet);
-
-        if (username !== user) {
-          plugin.logger.error(
-            {user, username},
-            'Rejecting auth because username @{user} does not match session username @{username}',
-          );
-          cb(null, false);
-          return;
-        }
-        if (tokenSet.expired()) {
-          plugin.logger.debug(
-            {username},
-            'Refreshing expired session for @{username}',
-          );
-
-          const client = await plugin.clientPromise;
-          tokenSet = await client.refresh(tokenSet);
-          await this.saveSession(sessionId, tokenSet);
-        }
-
-        plugin.logger.info({username}, 'Authenticated @{username}');
-
-        const roles = this.getRoles(tokenSet);
-        cb(null, [username, ...roles]);
-      })
-      .catch(err => {
-        // cb(err, ...) aborts Verdaccio's entire auth plugin chain outright
-        // (see @verdaccio/auth's authenticate()) -- it never falls through
-        // to htpasswd, defeating the break-glass fallback this plugin is
-        // deliberately configured ahead of. Falling through to the next
-        // auth plugin is the expected, by-design outcome of this plugin
-        // not authenticating the request, regardless of why.
-        plugin.logger.debug(
-          {err},
-          'oidc: error while authenticating: @{!err.message}\n@{err.stack} -- falling through to any other configured auth plugin',
-        );
-        cb(null, false);
-      });
+  // Every login this plugin performs ends in a signed npm or web token that
+  // apiJWTmiddleware() checks, so nothing it issues is a password. Declining
+  // passes the credentials on to the next auth plugin in Verdaccio's chain
+  // (htpasswd, for one), which is what checks a Basic credential or an
+  // `npm login` password.
+  public authenticate(
+    _user: string,
+    _password: string,
+    cb: AuthCallback,
+  ): void {
+    cb(null, false);
   }
 
   public apiJWTmiddleware?: (helpers: any) => any;
@@ -332,16 +323,15 @@ export default class OidcPlugin
     const plugin = this.getInstance();
 
     return (
-      req: express.Request & {remote_user: RemoteUserEx},
-      _res: express.Response,
-      _next: express.NextFunction,
+      req: Request & {remote_user: RemoteUserEx},
+      res: Response,
+      _next: NextFunction,
     ) => {
-      // Deliberately synchronous end-to-end: an async gap here (even a
-      // same-tick microtask, e.g. a session-storage lookup) corrupts
-      // Verdaccio's own nested web-UI router dispatch for this request --
-      // reproduced directly against real Verdaccio + Express, independent
-      // of req.pause()/resume() -- so this middleware must never await
-      // anything before calling next().
+      // The Bearer path below is deliberately synchronous end-to-end: an
+      // async gap there (even a same-tick microtask, e.g. a storage
+      // lookup) corrupts Verdaccio's own nested web-UI router dispatch for
+      // this request -- reproduced directly against real Verdaccio +
+      // Express -- so it must never await anything before calling next().
       const next = function (err?: Error) {
         // swallow error, user remains unauthorized
         // set remoteUserError to indicate that user was attempting authentication
@@ -358,6 +348,7 @@ export default class OidcPlugin
       }
 
       req.remote_user = helpers.createAnonymousRemoteUser();
+      res.locals.remote_user = req.remote_user;
 
       const {authorization} = req.headers;
       if (!authorization) {
@@ -367,10 +358,9 @@ export default class OidcPlugin
 
       const authorizationParts = authorization.split(' ', 2);
       if (authorizationParts.length !== 2) {
-        plugin.logger.warn(
-          {scheme: authorizationParts[0]},
-          'malformed authorization header @{scheme}',
-        );
+        // Never log the header itself: without a space it's the bare
+        // credential.
+        plugin.logger.warn({}, 'malformed authorization header');
         return next(new Error('malformed authorization header'));
       }
 
@@ -382,14 +372,9 @@ export default class OidcPlugin
         // sibling auth plugin configured alongside this one -- htpasswd
         // included -- could ever authenticate anything: confirmed directly,
         // removing this plugin restored htpasswd's Basic-Auth login.
-        // Delegating here, rather than only checking this plugin's own
-        // authenticate() (which only knows its own OIDC sessions), is what
-        // makes every configured auth plugin reachable again, not just this
-        // one -- exactly the "htpasswd fallback" the config already assumes.
-        // Async here is fine: unlike the OIDC-session check below (which
-        // runs on every single Bearer request, including ones headed for
-        // Verdaccio's web UI), Basic-Auth only happens once per login
-        // exchange and never targets the web UI's own routes.
+        // Delegating here is what makes every configured auth plugin
+        // reachable, not just this one -- exactly the "htpasswd fallback"
+        // the config already assumes.
         if (!plugin.authChain) {
           plugin.logger.error(
             {},
@@ -397,21 +382,28 @@ export default class OidcPlugin
           );
           return next(new Error('authentication is not ready'));
         }
-        const [basicUser, basicPassword] = Buffer.from(
-          authorizationParts[1],
-          'base64',
-        )
-          .toString('utf8')
-          .split(/:(.*)/s, 2);
+        const credentials = parseBasicCredentials(authorizationParts[1]);
+        if (!credentials) {
+          return next(new Error('malformed basic credentials'));
+        }
+        // The auth chain is async (htpasswd's bcrypt, for one), and
+        // Verdaccio's access log has already started reading the request
+        // with req.on('data'). Pausing, as Verdaccio's own middleware does,
+        // keeps a request body from streaming past before any parser is
+        // attached (verdaccio/verdaccio#1912).
+        req.pause();
         plugin.authChain.authenticate(
-          basicUser,
-          basicPassword,
+          credentials.user,
+          credentials.password,
           (err: Error | null, authenticatedUser: RemoteUserEx | false) => {
+            req.resume();
             if (err) {
               return next(err);
             }
             if (authenticatedUser) {
-              req.remote_user = authenticatedUser;
+              req.remote_user = credentials.tokenKey
+                ? {...authenticatedUser, token: {key: credentials.tokenKey}}
+                : authenticatedUser;
             }
             next();
           },
@@ -420,7 +412,7 @@ export default class OidcPlugin
       }
 
       const jwtRaw = authorizationParts[1];
-      let jwtPayload = undefined;
+      let jwtPayload: unknown = undefined;
 
       // signPayload() below never sets an `iss` claim on a token this plugin
       // itself issues -- only a foreign token (e.g. a CI provider's OIDC
@@ -444,7 +436,10 @@ export default class OidcPlugin
       }
 
       try {
-        jwtPayload = jwt.verify(jwtRaw, plugin.options.config.secret);
+        jwtPayload = jwt.verify(jwtRaw, plugin.options.config.secret, {
+          clockTolerance: DEFAULT_CLOCK_TOLERANCE_SEC,
+          ...plugin.options.config.security?.api?.jwt?.verify,
+        });
       } catch (err) {
         plugin.logger.error(
           {err},
@@ -456,7 +451,9 @@ export default class OidcPlugin
         return next(new Error('unable to verify jwt bearer token'));
       }
 
-      const {name, real_groups} = jwtPayload as RemoteUserEx;
+      const {name, real_groups, token} = jwtPayload as RemoteUser & {
+        token?: {key?: unknown};
+      };
       if (!name) {
         plugin.logger.error(
           {},
@@ -472,34 +469,53 @@ export default class OidcPlugin
         return next(new Error('jwt token does not contain real_groups'));
       }
 
-      // No session-storage lookup here: jwt.verify() above already confirms
-      // this exact {name, real_groups} pair was signed by us and has not
-      // expired (its own `exp` claim), which is what's trusted. This trades
-      // away near-real-time revocation (a logged-out session stays valid
-      // until its token's own expiresIn elapses) for staying synchronous.
-      req.remote_user = helpers.createRemoteUser(name, real_groups);
+      // jwt.verify() above already confirms this exact payload was signed by
+      // this registry and has not expired (its own `exp` claim), which is
+      // what's trusted. A token from `npm token create` also carries
+      // token.key: Verdaccio's router looks the token's read-only/CIDR
+      // settings and revocation up under it, so it has to survive here as it
+      // does in Verdaccio's own middleware.
+      const remoteUser = helpers.createRemoteUser(name, real_groups);
+      req.remote_user =
+        typeof token?.key === 'string'
+          ? {...remoteUser, token: {key: token.key}}
+          : remoteUser;
       next();
     };
   }
 
-  public register_middlewares(
-    app: Express,
-    auth: IBasicAuth<OidcPluginConfig>,
-  ): void {
+  public register_middlewares(app: Express, auth: VerdaccioAuth): void {
     const plugin = this.getInstance();
     plugin.authChain = auth;
+    const secret = auth.config.secret;
+
+    // `npm login`/`yarn npm login` are hardcoded, client-side, to call this
+    // URL, which is what lets an IdP access token obtained out-of-band (e.g.
+    // via `npx verdaccio-openid`) work by pasting it into `npm login`'s
+    // password prompt. Only such a token is handled here: one this plugin's
+    // own issuer signed, sent while that issuer advertises RFC 8693 token
+    // exchange. Anything else, an htpasswd password included, goes on to
+    // Verdaccio's own route (rate-limited, and backed by the auth chain)
+    // without ever being sent to the IdP.
     app.put(
       '/-/user/org.couchdb.user::userId',
-      express.json(),
+      bodyParser.json(),
       (req, res, next) => {
         Promise.resolve()
           .then(async () => {
-            const subjectToken = req.body.password;
-            if (!subjectToken) {
-              this.unauthorized(res, 'Password attribute is missing.');
+            const client = plugin.client;
+            const subjectToken = req.body?.password;
+            const userName = req.body?.name;
+            if (
+              client == null ||
+              typeof subjectToken !== 'string' ||
+              typeof userName !== 'string' ||
+              !supportsTokenExchange(client) ||
+              !isIssuedBy(subjectToken, client.issuer.metadata.issuer)
+            ) {
+              next();
               return;
             }
-            const userName = req.body.name;
             // Express's route-string type parser infers this route's param
             // key as the literal ":userId" (it doesn't fully replicate the
             // real runtime parser, path-to-regexp, for a param immediately
@@ -510,103 +526,7 @@ export default class OidcPlugin
               this.unauthorized(res, 'User ID in URL and body do not match.');
               return;
             }
-            // This URL is also the one plain `npm login`/`yarn login` are
-            // hardcoded, client-side, to call -- reusing it (rather than a
-            // separate route) is what lets a token obtained out-of-band
-            // (e.g. via `npx verdaccio-openid`) work by just pasting it into
-            // `npm login`'s password prompt, no custom client needed. So
-            // `password` here is tried as an OIDC access token first; a real
-            // password (htpasswd, or any other sibling auth plugin) will
-            // always fail this exchange -- that failure isn't a real error,
-            // it just means this wasn't an OIDC token, so fall through to
-            // the actual configured auth chain below instead of rejecting.
-            try {
-              const client = await plugin.clientPromise;
-              // client_id/client_secret (or lack thereof) are already
-              // applied per the Client's own configured
-              // token_endpoint_auth_method -- repeating them here would put
-              // a literal client_secret: undefined in the request body for
-              // a PKCE/public client.
-              const tokenSet = await client.grant({
-                grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange',
-                requested_token_type:
-                  'urn:ietf:params:oauth:token-type:refresh_token',
-                subject_token: subjectToken,
-                subject_token_type:
-                  'urn:ietf:params:oauth:token-type:access_token',
-                scope: plugin.config.scope,
-              });
-
-              const tokenUsername = this.getUsername(tokenSet);
-              if (userName !== tokenUsername) {
-                this.unauthorized(
-                  res,
-                  'Access token is not issued for the user trying to log in.',
-                );
-                return;
-              }
-
-              const sessionId = await nanoid();
-              const {npmToken} = await this.saveSessionAndCreateTokens(
-                sessionId,
-                tokenSet,
-                auth,
-              );
-              res.status(201);
-              res
-                .set('Content-Type', 'application/json')
-                .end(JSON.stringify({token: npmToken}));
-              return;
-            } catch (oidcErr) {
-              plugin.logger.debug(
-                {err: oidcErr},
-                "PUT /-/user: password isn't a valid OIDC access token (@{!err.message}) -- trying the configured auth chain instead",
-              );
-            }
-
-            plugin.authChain?.authenticate(
-              userName,
-              subjectToken,
-              (err: Error | null, remoteUser: RemoteUserEx | false) => {
-                if (err) {
-                  return next(err);
-                }
-                if (!remoteUser) {
-                  this.unauthorized(res, 'Invalid username or password.');
-                  return;
-                }
-                Promise.resolve(
-                  (auth as any).jwtEncrypt(remoteUser, {
-                    expiresIn:
-                      this.options.config.security?.api?.jwt?.sign?.expiresIn,
-                  }),
-                )
-                  .then((token: unknown) => {
-                    res.status(201);
-                    res.set('Content-Type', 'application/json').end(
-                      JSON.stringify({
-                        ok: `user '${userName}' created`,
-                        token,
-                      }),
-                    );
-                  })
-                  .catch(next);
-              },
-            );
-          })
-          .catch(next);
-      },
-    );
-
-    if (plugin.config.accessTokenAuth !== true) {
-      app.post('/-/v1/login', express.json(), (req, res, next) => {
-        Promise.resolve()
-          .then(async () => {
-            if (!checkAndConsumeMintBudget(req.ip ?? 'unknown')) {
-              plugin.logger.warn(
-                {ip: req.ip},
-                'rejected /-/v1/login: mint budget exceeded for @{ip}',
-              );
+            if (!plugin.exchangeBudget.take(req.ip ?? 'unknown')) {
               res.status(429);
               res
                 .set('Content-Type', 'text/plain')
@@ -614,8 +534,61 @@ export default class OidcPlugin
               return;
             }
 
-            const loginRequestId = await signLoginRequestId(auth.config.secret);
+            let tokenSet: TokenSet;
+            try {
+              // client_id/client_secret (or lack thereof) are already
+              // applied per the Client's own configured
+              // token_endpoint_auth_method -- repeating them here would put
+              // a literal client_secret: undefined in the request body for
+              // a PKCE/public client.
+              tokenSet = await client.grant({
+                grant_type: TOKEN_EXCHANGE_GRANT,
+                requested_token_type:
+                  'urn:ietf:params:oauth:token-type:refresh_token',
+                subject_token: subjectToken,
+                subject_token_type:
+                  'urn:ietf:params:oauth:token-type:access_token',
+                scope: plugin.config.scope,
+              });
+            } catch (err) {
+              plugin.logger.info(
+                {err},
+                'PUT /-/user: the identity provider rejected the token exchange (@{!err.message})',
+              );
+              this.unauthorized(
+                res,
+                'The identity provider rejected this access token.',
+              );
+              return;
+            }
 
+            const tokenUsername = this.getUsername(tokenSet);
+            if (userName !== tokenUsername) {
+              this.unauthorized(
+                res,
+                'Access token is not issued for the user trying to log in.',
+              );
+              return;
+            }
+            if (this.rejectUnmetRequiredClaim(res, tokenSet)) return;
+
+            const {npmToken} = await this.createTokens(tokenSet, auth);
+            res.status(201);
+            res
+              .set('Content-Type', 'application/json')
+              .end(JSON.stringify({token: npmToken}));
+          })
+          .catch(next);
+      },
+    );
+
+    if (plugin.config.accessTokenAuth !== true) {
+      app.post('/-/v1/login', noCors, (req, res, next) => {
+        Promise.resolve()
+          .then(() => {
+            if (!this.takeMintBudget(req, res, '/-/v1/login')) return;
+
+            const loginRequestId = signLoginRequestId(secret, 'cli');
             res.set('Content-Type', 'application/json').end(
               JSON.stringify({
                 loginUrl: new URL(
@@ -637,139 +610,182 @@ export default class OidcPlugin
       // web.scriptsBodyAfter in this repo's deployment docs) -- as opposed to
       // /-/v1/login above, which exists for the npm/yarn CLI's web-login
       // handshake (JSON response, polled doneUrl) and isn't link-able from a
-      // browser. Mints the same signed, rate-limited loginRequestId and skips
-      // straight to the same /-/oidc/login/:id redirect used by that flow.
-      app.get('/-/oidc/start', (req, res, next) => {
+      // browser. The person is already in the browser that will receive the
+      // token, so this goes straight to the IdP with no confirmation page.
+      app.get('/-/oidc/start', noCors, (req, res, next) => {
         Promise.resolve()
           .then(async () => {
-            if (!checkAndConsumeMintBudget(req.ip ?? 'unknown')) {
-              plugin.logger.warn(
-                {ip: req.ip},
-                'rejected /-/oidc/start: mint budget exceeded for @{ip}',
-              );
-              res.status(429);
-              res
-                .set('Content-Type', 'text/plain')
-                .end('too many login attempts, try again later');
-              return;
-            }
-
-            const loginRequestId = await signLoginRequestId(auth.config.secret);
-            res.redirect(`/-/oidc/login/${loginRequestId}`);
+            if (!this.takeMintBudget(req, res, '/-/oidc/start')) return;
+            await this.redirectToIdp(
+              res,
+              signLoginRequestId(secret, 'web'),
+              secret,
+            );
           })
           .catch(next);
       });
     }
 
-    app.get('/-/oidc/login/:loginRequestId', (req, res, next) => {
-      Promise.resolve()
-        .then(async () => {
-          if (
-            !verifyAndConsumeLoginRequestId(
-              req.params.loginRequestId,
-              auth.config.secret,
-            )
-          ) {
-            this.rejectInvalidLoginRequestId(res);
-            return;
-          }
+    // loginUrl for npm/yarn's web login. Anyone can mint a login request id
+    // and send its loginUrl to someone else, so this never goes straight to
+    // the IdP: whoever opens it is asked to confirm, and the POST below only
+    // proceeds when it comes from that same page in that same browser.
+    app.get('/-/oidc/login/:loginRequestId', noCors, (req, res) => {
+      const loginRequestId = req.params.loginRequestId;
+      const request = verifyAndConsumeLoginRequestId(loginRequestId, secret);
+      if (request?.kind !== 'cli') {
+        this.rejectInvalidLoginRequestId(res);
+        return;
+      }
 
-          const client = await plugin.clientPromise;
-
-          let pkceParams = {};
-          if (plugin.usePkce) {
-            const codeVerifier = generators.codeVerifier();
-            // Keyed by loginRequestId (== the `state` sent to the IdP) so
-            // /-/oidc/callback below can look it up once the browser returns;
-            // 5 minutes comfortably covers a user completing the IdP's own
-            // login page, matching the TTL used for the post-login token
-            // handoff further down in this file.
-            await plugin.ts.set(
-              `pkce:${req.params.loginRequestId}`,
-              codeVerifier,
-              5 * 60,
-            );
-            pkceParams = {
-              code_challenge: generators.codeChallenge(codeVerifier),
-              code_challenge_method: 'S256',
-            };
-          }
-
-          const authorizationUrl = client.authorizationUrl({
-            scope: plugin.config.scope || 'openid email profile',
-            state: req.params.loginRequestId,
-            redirect_uri: new URL(
-              '-/oidc/callback',
-              plugin.config.publicUrl,
-            ).toString(),
-            ...pkceParams,
-          });
-
-          res.redirect(authorizationUrl);
-        })
-        .catch(next);
+      const csrf = randomBytes(16).toString('base64url');
+      setCookie(res, csrfCookieName(loginRequestId), csrf, {
+        path: publicPath(plugin.config.publicUrl, '-/oidc/login'),
+        sameSite: 'Strict',
+        secure: isHttps(plugin.config.publicUrl),
+      });
+      sendHtml(
+        res,
+        200,
+        confirmationPageHtml(new URL(plugin.config.publicUrl).host, csrf),
+        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
+      );
     });
 
-    app.get('/-/oidc/callback', (req, res, next) => {
+    app.post(
+      '/-/oidc/login/:loginRequestId',
+      noCors,
+      bodyParser.urlencoded({extended: false}),
+      (req, res, next) => {
+        Promise.resolve()
+          .then(async () => {
+            const loginRequestId = req.params.loginRequestId;
+            const cookieName = csrfCookieName(loginRequestId);
+            // A SameSite=Strict cookie isn't sent with a POST another site
+            // starts, so a page elsewhere can't submit this form for someone.
+            if (!safeEqual(req.body?.csrf, readCookie(req, cookieName))) {
+              sendText(
+                res,
+                403,
+                'Open the sign-in link and confirm it in the same browser.',
+              );
+              return;
+            }
+            clearCookie(
+              res,
+              cookieName,
+              publicPath(plugin.config.publicUrl, '-/oidc/login'),
+            );
+
+            const request = verifyAndConsumeLoginRequestId(
+              loginRequestId,
+              secret,
+            );
+            if (request?.kind !== 'cli') {
+              this.rejectInvalidLoginRequestId(res);
+              return;
+            }
+            await this.redirectToIdp(res, loginRequestId, secret);
+          })
+          .catch(next);
+      },
+    );
+
+    app.get('/-/oidc/callback', noCors, (req, res, next) => {
       Promise.resolve()
         .then(async () => {
           const client = await plugin.clientPromise;
           const params = client.callbackParams(req);
+          const loginRequestId = params.state;
 
-          if (
-            typeof params.state !== 'string' ||
-            !verifyAndConsumeLoginRequestId(params.state, auth.config.secret)
-          ) {
+          const request =
+            typeof loginRequestId === 'string'
+              ? verifyAndConsumeLoginRequestId(loginRequestId, secret)
+              : null;
+          if (request == null || typeof loginRequestId !== 'string') {
             this.rejectInvalidLoginRequestId(res);
             return;
           }
 
-          // Short poll window as a safety margin for storage propagation
-          // delay -- the verifier was already written before the IdP
-          // redirect, so it should be there immediately.
-          const codeVerifier = plugin.usePkce
-            ? await plugin.ts.get(`pkce:${params.state}`, 5)
-            : null;
+          // Set by redirectToIdp() in the browser that started this login.
+          // Without it, a callback URL for someone else's login, handed to
+          // this browser, would sign this browser in as them.
+          const cookieName = browserCookieName(loginRequestId);
+          if (
+            !safeEqual(
+              readCookie(req, cookieName),
+              loginRequestSecret(secret, 'browser', loginRequestId),
+            )
+          ) {
+            sendText(
+              res,
+              403,
+              'Finish signing in in the browser that started it.',
+            );
+            return;
+          }
+          clearCookie(
+            res,
+            cookieName,
+            publicPath(plugin.config.publicUrl, '-/oidc/callback'),
+          );
 
           const tokenSet = await client.callback(
             new URL('-/oidc/callback', plugin.config.publicUrl).toString(),
             params,
             {
-              state: params.state,
-              ...(codeVerifier ? {code_verifier: codeVerifier} : {}),
+              state: loginRequestId,
+              nonce: loginRequestSecret(secret, 'nonce', loginRequestId),
+              response_type: 'code',
+              ...(plugin.usePkce
+                ? {
+                    code_verifier: loginRequestSecret(
+                      secret,
+                      'pkce',
+                      loginRequestId,
+                    ),
+                  }
+                : {}),
             },
           );
+          if (this.rejectUnmetRequiredClaim(res, tokenSet)) return;
 
-          const loginRequestId = params.state;
-          const sessionId = await nanoid();
-          const {npmToken, webToken} = await this.saveSessionAndCreateTokens(
-            sessionId,
-            tokenSet,
-            auth,
+          const {npmToken, webToken} = await this.createTokens(tokenSet, auth);
+
+          // Only npm/yarn's web login polls doneUrl for a token.
+          if (request.kind === 'cli') {
+            const remainingSec =
+              MAX_AGE_SEC - (Math.floor(Date.now() / 1000) - request.issuedAt);
+            await plugin.ts.set(
+              `login:${loginRequestId}`,
+              npmToken,
+              Math.max(1, remainingSec),
+            );
+          }
+          sendHtml(
+            res,
+            200,
+            callbackResponseHtml(this.getUsername(tokenSet), webToken),
+            "frame-ancestors 'none'",
           );
-
-          await plugin.ts.set(`login:${loginRequestId}`, npmToken, 5 * 60);
-          res
-            .set('Content-Type', 'text/html')
-            .end(callbackResponseHtml(this.getUsername(tokenSet), webToken));
         })
         .catch(next);
     });
 
-    app.get('/-/oidc/done/:loginRequestId', (req, res, next) => {
+    // Hands the token to the first poll that finds it, and only that one.
+    app.get('/-/oidc/done/:loginRequestId', noCors, (req, res, next) => {
       Promise.resolve()
         .then(async () => {
-          if (
-            !verifyAndConsumeLoginRequestId(
-              req.params.loginRequestId,
-              auth.config.secret,
-            )
-          ) {
+          const request = verifyAndConsumeLoginRequestId(
+            req.params.loginRequestId,
+            secret,
+          );
+          if (request?.kind !== 'cli') {
             this.rejectInvalidLoginRequestId(res);
             return;
           }
 
-          const token = await plugin.ts.get(
+          const token = await plugin.ts.consume(
             `login:${req.params.loginRequestId}`,
             10,
           );
@@ -787,15 +803,83 @@ export default class OidcPlugin
     });
   }
 
+  private takeMintBudget(req: Request, res: Response, route: string): boolean {
+    const plugin = this.getInstance();
+    if (checkAndConsumeMintBudget(req.ip ?? 'unknown')) return true;
+    plugin.logger.warn(
+      {ip: req.ip, route},
+      'rejected @{route}: mint budget exceeded for @{ip}',
+    );
+    sendText(res, 429, 'too many login attempts, try again later');
+    return false;
+  }
+
+  // Sends the browser to the IdP for this login request, with the PKCE
+  // challenge and nonce derived from its id, after setting the cookie the
+  // callback checks.
+  private async redirectToIdp(
+    res: Response,
+    loginRequestId: string,
+    secret: string,
+  ): Promise<void> {
+    const plugin = this.getInstance();
+    const client = await plugin.clientPromise;
+
+    setCookie(
+      res,
+      browserCookieName(loginRequestId),
+      loginRequestSecret(secret, 'browser', loginRequestId),
+      {
+        path: publicPath(plugin.config.publicUrl, '-/oidc/callback'),
+        // Lax, not Strict: the callback arrives as a cross-site top-level
+        // redirect from the IdP, which Lax cookies are sent with.
+        sameSite: 'Lax',
+        secure: isHttps(plugin.config.publicUrl),
+      },
+    );
+
+    const authorizationUrl = client.authorizationUrl({
+      scope: plugin.config.scope || 'openid email profile',
+      state: loginRequestId,
+      nonce: loginRequestSecret(secret, 'nonce', loginRequestId),
+      redirect_uri: new URL(
+        '-/oidc/callback',
+        plugin.config.publicUrl,
+      ).toString(),
+      ...(plugin.usePkce
+        ? {
+            code_challenge: generators.codeChallenge(
+              loginRequestSecret(secret, 'pkce', loginRequestId),
+            ),
+            code_challenge_method: 'S256',
+          }
+        : {}),
+    });
+
+    res.set('Referrer-Policy', 'no-referrer');
+    res.redirect(authorizationUrl);
+  }
+
+  private rejectUnmetRequiredClaim(res: Response, tokenSet: TokenSet): boolean {
+    const plugin = this.getInstance();
+    const unmet = this.unmetRequiredClaim(tokenSet);
+    if (unmet == null) return false;
+    plugin.logger.warn(
+      {claim: unmet},
+      'rejected a login: the ID token does not satisfy requiredClaims.@{claim}',
+    );
+    sendText(res, 403, 'This account is not allowed to sign in here.');
+    return true;
+  }
+
   private unauthorized(res: Response, msg: string): void {
     const plugin = this.getInstance();
     plugin.logger.trace({msg}, 'Unauthorized access: @{msg}');
-    res.status(401);
-    res.set('Content-Type', 'text/plain').end(msg);
+    sendText(res, 401, msg);
   }
 
   // Rejects a forged, expired, or exhausted-budget login request id --
-  // before any of /-/oidc/login, /-/oidc/callback, or /-/oidc/done touch session/
+  // before any of /-/oidc/login, /-/oidc/callback, or /-/oidc/done touch
   // token storage. See loginRequestId.ts for why this check exists.
   private rejectInvalidLoginRequestId(res: Response): void {
     const plugin = this.getInstance();
@@ -803,34 +887,187 @@ export default class OidcPlugin
       {},
       'rejected login request id with invalid signature, expired, or over its use budget',
     );
-    res.status(400);
-    res.set('Content-Type', 'text/plain').end('invalid login request id');
+    sendText(res, 400, 'invalid login request id');
   }
 
-  private async saveSessionAndCreateTokens(
-    sessionId: string,
+  private async createTokens(
     tokenSet: TokenSet,
-    auth: IBasicAuth<OidcPluginConfig>,
+    auth: VerdaccioAuth,
   ): Promise<Tokens> {
-    await this.saveSession(sessionId, tokenSet);
     const username = this.getUsername(tokenSet);
     const userroles = this.getRoles(tokenSet);
+    const user = createRemoteUser(username, userroles);
+    const security = this.options.config.security;
 
-    const rUser = {
-      ...createRemoteUser(username, userroles),
-      sid: sessionId,
-    };
-    const npmToken = await signPayload(rUser, auth.config.secret, {
-      expiresIn: this.options.config.security?.api?.jwt?.sign?.expiresIn,
+    const npmToken = await signPayload(user, auth.config.secret, {
+      expiresIn:
+        security?.api?.jwt?.sign?.expiresIn ?? DEFAULT_TOKEN_EXPIRES_IN,
     });
-    const webToken = await signPayload(rUser, auth.config.secret, {
-      // default expiration for web tokens is 7 days:
-      // https://github.com/verdaccio/verdaccio/blob/64f0921477ef68fc96a2327c7a3c86a45f6d0255/packages/config/src/security.ts#L5-L11
-      expiresIn: this.options.config.security?.web?.sign?.expiresIn ?? '7d',
+    const webToken = await signPayload(user, auth.config.secret, {
+      expiresIn: security?.web?.sign?.expiresIn ?? DEFAULT_TOKEN_EXPIRES_IN,
     });
 
     return {npmToken, webToken};
   }
+}
+
+function normalizeRequiredClaims(
+  input: OidcPluginConfig['requiredClaims'],
+): Array<[string, ClaimValue[]]> {
+  if (input == null) return [];
+  if (typeof input !== 'object' || Array.isArray(input)) {
+    throw new Error(
+      'invalid configuration: requiredClaims must map claim names to allowed values',
+    );
+  }
+  return Object.entries(input).map(([claim, value]) => {
+    const allowed = Array.isArray(value) ? value : [value];
+    if (
+      claim === '' ||
+      allowed.length === 0 ||
+      !allowed.every(v => ['string', 'number', 'boolean'].includes(typeof v))
+    ) {
+      throw new Error(
+        `invalid configuration: requiredClaims.${claim} must be a string, number or boolean, or a non-empty list of them`,
+      );
+    }
+    return [claim, allowed];
+  });
+}
+
+function supportsTokenExchange(client: Client): boolean {
+  const grants = client.issuer.metadata.grant_types_supported;
+  return Array.isArray(grants) && grants.includes(TOKEN_EXCHANGE_GRANT);
+}
+
+// True only for a JWT whose `iss` is this plugin's issuer. Signature and
+// expiry are the IdP's to check during the exchange; this only keeps every
+// other password away from the IdP.
+function isIssuedBy(token: string, issuer: unknown): boolean {
+  const payload = jwt.decode(token);
+  return (
+    typeof issuer === 'string' &&
+    payload != null &&
+    typeof payload === 'object' &&
+    payload.iss === issuer
+  );
+}
+
+// The same two forms Verdaccio's own parseBasicPayload accepts: JSON
+// {user, password, tokenKey?}, or "user:password" split at the first colon.
+function parseBasicCredentials(
+  encoded: string,
+): {user: string; password: string; tokenKey?: string} | null {
+  const decoded = Buffer.from(encoded, 'base64').toString('utf8');
+  if (decoded.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(decoded);
+      if (
+        typeof parsed?.user === 'string' &&
+        typeof parsed?.password === 'string'
+      ) {
+        return {
+          user: parsed.user,
+          password: parsed.password,
+          ...(typeof parsed.tokenKey === 'string'
+            ? {tokenKey: parsed.tokenKey}
+            : {}),
+        };
+      }
+    } catch {
+      // not JSON after all; try user:password below
+    }
+  }
+  const index = decoded.indexOf(':');
+  if (index < 0) return null;
+  return {user: decoded.slice(0, index), password: decoded.slice(index + 1)};
+}
+
+// Verdaccio's app answers every request with Access-Control-Allow-Origin: *.
+// On the login routes that would let any web page start a login and read
+// its result from inside a visitor's browser, so the header comes off.
+function noCors(_req: Request, res: Response, next: NextFunction): void {
+  res.removeHeader('Access-Control-Allow-Origin');
+  next();
+}
+
+function isHttps(publicUrl: string): boolean {
+  return new URL(publicUrl).protocol === 'https:';
+}
+
+// The path a browser sees for one of this plugin's routes, which includes
+// any prefix publicUrl has (a registry served under /npm/, say).
+function publicPath(publicUrl: string, route: string): string {
+  return new URL(route, publicUrl).pathname;
+}
+
+// Named per login request (its nonce is the id's first segment), so two
+// logins running in one browser don't overwrite each other's cookies.
+function csrfCookieName(loginRequestId: string): string {
+  return `oidc_csrf_${loginRequestId.split('.')[0]}`;
+}
+
+function browserCookieName(loginRequestId: string): string {
+  return `oidc_login_${loginRequestId.split('.')[0]}`;
+}
+
+function setCookie(
+  res: Response,
+  name: string,
+  value: string,
+  {
+    path,
+    sameSite,
+    secure,
+  }: {path: string; sameSite: 'Strict' | 'Lax'; secure: boolean},
+): void {
+  res.append(
+    'Set-Cookie',
+    `${name}=${value}; Path=${path}; Max-Age=${MAX_AGE_SEC}; HttpOnly; SameSite=${sameSite}${secure ? '; Secure' : ''}`,
+  );
+}
+
+function clearCookie(res: Response, name: string, path: string): void {
+  res.append('Set-Cookie', `${name}=; Path=${path}; Max-Age=0; HttpOnly`);
+}
+
+function readCookie(req: Request, name: string): string | undefined {
+  for (const part of (req.headers.cookie ?? '').split(';')) {
+    const eq = part.indexOf('=');
+    if (eq > 0 && part.slice(0, eq).trim() === name) {
+      return part.slice(eq + 1).trim();
+    }
+  }
+  return undefined;
+}
+
+function safeEqual(a: unknown, b: unknown): boolean {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const left = Buffer.from(a);
+  const right = Buffer.from(b);
+  return left.length === right.length && timingSafeEqual(left, right);
+}
+
+function sendText(res: Response, status: number, message: string): void {
+  res.status(status);
+  res.set('Content-Type', 'text/plain').end(message);
+}
+
+function sendHtml(
+  res: Response,
+  status: number,
+  html: string,
+  contentSecurityPolicy: string,
+): void {
+  res.status(status);
+  res.set({
+    'Content-Type': 'text/html; charset=utf-8',
+    'Content-Security-Policy': contentSecurityPolicy,
+    'X-Frame-Options': 'DENY',
+    'Cache-Control': 'no-store',
+    'Referrer-Policy': 'no-referrer',
+  });
+  res.end(html);
 }
 
 function createRemoteUser(name: string, pluginGroups: string[]): RemoteUser {
@@ -852,7 +1089,7 @@ function createRemoteUser(name: string, pluginGroups: string[]): RemoteUser {
 }
 
 function signPayload(
-  payload: RemoteUserEx,
+  payload: RemoteUser,
   secretOrPrivateKey: string,
   options: JWTSignOptions,
 ): Promise<string> {
@@ -867,6 +1104,39 @@ function signPayload(
     );
   });
 }
+
+const escapeHtml = (value: string) =>
+  value.replace(
+    /[&<>"']/g,
+    c =>
+      ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'})[
+        c
+      ] as string,
+  );
+
+// An empty form action posts back to this page's own URL.
+const confirmationPageHtml = (host: string, csrf: string) => `
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Sign in to ${escapeHtml(host)}</title>
+  </head>
+  <body>
+    <h1>Sign in to ${escapeHtml(host)}</h1>
+    <p>
+      npm or yarn on a computer asked to sign in to this registry as you.
+      Continue only if you just ran a command that needed to sign in, such as
+      <code>npm login</code> or <code>yarn npm login</code>. If you didn't,
+      close this page.
+    </p>
+    <form method="POST" action="">
+      <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+      <button type="submit">Continue</button>
+    </form>
+  </body>
+</html>
+`;
 
 // JSON.stringify alone only guarantees valid *JS string* syntax -- it never
 // escapes the "<" character, so a value containing a literal "</script>"

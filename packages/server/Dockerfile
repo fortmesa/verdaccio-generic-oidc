@@ -1,4 +1,4 @@
-ARG VERDACCIO_VERSION=6.0.0
+ARG VERDACCIO_VERSION=6.10.7
 FROM verdaccio/verdaccio:${VERDACCIO_VERSION} AS base
 
 # Build context is the repo root (see docker-compose.yml's `context: ../..`),
@@ -14,7 +14,7 @@ COPY package.json yarn.lock .yarnrc.yml ./
 COPY packages/server/package.json packages/server/package.json
 COPY packages/yarn-plugin-oidc-login/package.json packages/yarn-plugin-oidc-login/package.json
 
-# ioredis / generic-pool / @aws-sdk/client-dynamodb / @aws-sdk/lib-dynamodb
+# ioredis / @aws-sdk/client-dynamodb / @aws-sdk/lib-dynamodb
 # are declared as optional peerDependencies (peerDependenciesMeta.optional)
 # in the real, published package.json -- correct for real consumers, who
 # explicitly install whichever backend they use, per this plugin's whole
@@ -34,7 +34,7 @@ COPY packages/yarn-plugin-oidc-login/package.json packages/yarn-plugin-oidc-logi
 #
 # The fix: since Node's require() doesn't consult package.json's
 # dependency-type fields at all at runtime (only a package manager does,
-# at install time), it's harmless to temporarily move these four entries
+# at install time), it's harmless to temporarily move these three entries
 # from peerDependencies into plain optionalDependencies just to drive this
 # image's install -- `optionalDependencies` behaves like a normal
 # dependency for install purposes (attempted by default, not required to

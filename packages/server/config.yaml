@@ -13,8 +13,9 @@ auth:
     # trailing slash.
     publicUrl: http://localhost:4873
 
-    # Exactly one of redis / filesystem / dynamo is required, for session and
-    # token storage (see docs/configuration.md, "Storage backends").
+    # Exactly one of redis / filesystem / dynamo is required. It holds a
+    # finished login's npm token until the CLI picks it up (see
+    # docs/configuration.md, "Storage backends").
 
     # Redis: works across multiple Verdaccio replicas. `keyPrefix` namespaces
     # every key, for sharing one Redis instance legibly with other consumers
@@ -27,7 +28,6 @@ auth:
     # Filesystem: zero extra dependencies, but doesn't work across multiple
     # replicas (each has its own disk). Used if `redis`/`dynamo` aren't set.
     #filesystem:
-    #  sessionPath: /tmp
     #  tokenPath: /tmp
 
     # DynamoDB: works across multiple replicas. `tableName` is required;
@@ -39,14 +39,6 @@ auth:
     #  keyPrefix: verdaccio-oidc-
     #  sortKeyValue: OIDC
     #  ttlAttribute: expireTime
-
-    session:
-      # How long (seconds) a session lookup is trusted from an in-memory
-      # cache before re-checking the storage backend above --
-      # authenticate() runs on every authenticated request, not just
-      # logins, so this matters regardless of which backend is selected.
-      # Default is 5 minutes (300); set to 0 to disable caching entirely.
-      cacheTtl: 300
 
     # OpenID Connect Issuer URL -- "keycloak" here is the docker-compose
     # service name, reachable from the verdaccio container over the compose

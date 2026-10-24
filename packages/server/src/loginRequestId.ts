@@ -1,5 +1,4 @@
-import {createHmac, timingSafeEqual} from 'crypto';
-import {nanoid} from 'nanoid/async';
+import {createHmac, randomBytes, timingSafeEqual} from 'crypto';
 
 // Truncated to 16 bytes/32 hex chars -- this is a forgery check, not a
 // general-purpose MAC, so the full SHA-256 output length buys nothing extra
@@ -8,20 +7,17 @@ import {nanoid} from 'nanoid/async';
 const HMAC_BYTES = 16;
 
 // Total time a signed id remains acceptable at all, regardless of how many
-// times it's used within that window. Deliberately short: this is also the
-// realistic window for the device-code-phishing-style risk described in
-// docs/web-login-protocol.md (an attacker mints an id, hands loginUrl to a
-// victim, then polls doneUrl themselves) -- npm/Yarn's own client protocol
-// gives no way to close that off outright (see that doc), so keeping this
-// window tight is the one thing this project can still do to shrink the
-// realistic attack window, short of breaking real login usability. 90s
-// is the floor a real human needs to open the browser, authenticate with
-// the IdP, and land back on the callback page.
-export const MAX_AGE_SEC = 90;
+// times it's used within that window. It covers the whole human login: the
+// confirmation page, the IdP's own sign-in (password, 2FA, consent), the
+// callback, and the CLI's last poll of doneUrl. What stops someone else
+// collecting a token through an id they minted is the confirmation click at
+// loginUrl and doneUrl handing the token out once (see index.ts), not the
+// length of this window.
+export const MAX_AGE_SEC = 10 * 60;
 
 // A legitimate login flow touches storage a small, predictable number of
-// times: one write at /-/oidc/login, one read (plus a possible PKCE lookup)
-// at /-/oidc/callback, and a handful of /-/oidc/done polls. /-/oidc/done blocks
+// times: the confirmation page and its POST at /-/oidc/login, one write at
+// /-/oidc/callback, and a handful of /-/oidc/done polls. /-/oidc/done blocks
 // server-side for up to 10s per call, so even a client re-polling the
 // instant each call returns can't exceed MAX_AGE_SEC / 10s =~ 60 calls
 // within the id's lifetime -- 100 leaves headroom above that theoretical
@@ -34,7 +30,7 @@ export const MAX_USES = 100;
 // The use-budget above only bounds abuse of a *single* id -- it does
 // nothing to stop an attacker from minting an unlimited number of fresh,
 // fully legitimate ids in the first place, since /-/v1/login is (correctly)
-// unauthenticated and touches no storage at all (just nanoid() + an HMAC,
+// unauthenticated and touches no storage at all (random bytes + an HMAC,
 // both cheap local CPU). Without also capping the mint rate, MAX_USES is
 // not a real bound at all: N minted ids x MAX_USES each is still
 // N x MAX_USES total backend hits, and N is uncapped. Sharing the same
@@ -53,6 +49,42 @@ function computeMac(payload: string, secret: string): string {
     .update(payload)
     .digest('hex')
     .slice(0, HMAC_BYTES * 2);
+}
+
+// What started the login: 'cli' is npm/yarn's web login (/-/v1/login),
+// which picks its token up from doneUrl; 'web' is a person signing in to
+// the web UI (/-/oidc/start), which never needs one stored for pickup.
+export type LoginRequestKind = 'cli' | 'web';
+
+export interface LoginRequest {
+  kind: LoginRequestKind;
+  issuedAt: number;
+}
+
+// nonce: 16 random bytes, base64url. mac: HMAC_BYTES of lowercase hex.
+// Anything else is rejected before the MAC is checked, so one id can't be
+// re-spelled (upper-case hex, trailing junk Buffer.from(hex) would ignore)
+// into many ids that each get a fresh use budget.
+const LOGIN_REQUEST_ID_PATTERN =
+  /^([A-Za-z0-9_-]{22})\.(\d{1,12})\.(cli|web)\.([0-9a-f]{32})$/;
+
+/**
+ * A value only this registry can compute for one login request id, for the
+ * given purpose: the PKCE code verifier, the OIDC nonce, and the cookie that
+ * ties the callback to the browser that started the login. Deriving them
+ * from the id with the instance secret means none of them has to be stored
+ * between /-/oidc/login and /-/oidc/callback. The id itself travels in URLs
+ * and the `state` parameter; these never do, apart from the nonce, which
+ * the IdP echoes back inside the signed ID token.
+ */
+export function loginRequestSecret(
+  secret: string,
+  purpose: 'pkce' | 'nonce' | 'browser',
+  id: string,
+): string {
+  return createHmac('sha256', secret)
+    .update(`${purpose}:${id}`)
+    .digest('base64url');
 }
 
 type BudgetEntry = {count: number; issuedAt: number};
@@ -79,12 +111,45 @@ function startBudgetGc(map: Map<string, BudgetEntry>, maxAgeSec: number): void {
   timer.unref?.();
 }
 
+// Keyed by the id's nonce.
 const useCounts = new Map<string, BudgetEntry>();
 startBudgetGc(useCounts, MAX_AGE_SEC);
 
-// Keyed by source (in practice, req.ip).
-const mintCounts = new Map<string, BudgetEntry>();
-startBudgetGc(mintCounts, MINT_WINDOW_SEC);
+/**
+ * A per-source counter over fixed windows: take(source) returns false once
+ * that source has used `max` within the current `windowSec` window. Used for
+ * the mint budget below and for token-exchange attempts in index.ts.
+ *
+ * Sources are whatever the caller passes, in practice req.ip, which
+ * reflects whatever trust-proxy configuration Verdaccio's own Express app
+ * has (or hasn't) been given -- this plugin doesn't set that itself, it only
+ * adds routes to Verdaccio's existing app. If you're running behind a
+ * reverse proxy, verify req.ip actually resolves to real client addresses
+ * for your deployment, not the proxy's own address -- otherwise every user
+ * behind that proxy shares one budget.
+ */
+export function createSourceBudget(
+  max: number,
+  windowSec: number,
+): {take(source: string): boolean} {
+  const counts = new Map<string, BudgetEntry>();
+  startBudgetGc(counts, windowSec);
+  return {
+    take(source: string): boolean {
+      const nowSec = Math.floor(Date.now() / 1000);
+      const entry = counts.get(source);
+      if (entry == null || nowSec - entry.issuedAt > windowSec) {
+        counts.set(source, {count: 1, issuedAt: nowSec});
+        return true;
+      }
+      if (entry.count >= max) return false;
+      entry.count += 1;
+      return true;
+    },
+  };
+}
+
+const mintBudget = createSourceBudget(MAX_MINTS_PER_WINDOW, MINT_WINDOW_SEC);
 
 /**
  * Call before signLoginRequestId() with a per-source key (req.ip). Returns
@@ -92,26 +157,9 @@ startBudgetGc(mintCounts, MINT_WINDOW_SEC);
  * current window -- the caller should reject the request (429) without
  * minting anything, rather than handing out an id that just adds to an
  * already-large pile.
- *
- * req.ip reflects whatever trust-proxy configuration Verdaccio's own
- * Express app has (or hasn't) been given -- this plugin doesn't set that
- * itself, it only adds routes to Verdaccio's existing app. If you're
- * running behind a reverse proxy, verify req.ip actually resolves to real
- * client addresses for your deployment, not the proxy's own address --
- * otherwise every user behind that proxy shares one mint budget.
  */
 export function checkAndConsumeMintBudget(source: string): boolean {
-  const nowSec = Math.floor(Date.now() / 1000);
-  const entry = mintCounts.get(source);
-
-  if (entry == null || nowSec - entry.issuedAt > MINT_WINDOW_SEC) {
-    mintCounts.set(source, {count: 1, issuedAt: nowSec});
-    return true;
-  }
-
-  if (entry.count >= MAX_MINTS_PER_WINDOW) return false;
-  entry.count += 1;
-  return true;
+  return mintBudget.take(source);
 }
 
 /**
@@ -139,41 +187,47 @@ export function checkAndConsumeMintBudget(source: string): boolean {
  * together (mints per source, uses per id) turn "unbounded" into a small,
  * fixed MAX_MINTS_PER_WINDOW * MAX_USES per source per window.
  */
-export async function signLoginRequestId(secret: string): Promise<string> {
-  const nonce = await nanoid();
+export function signLoginRequestId(
+  secret: string,
+  kind: LoginRequestKind,
+): string {
+  const nonce = randomBytes(16).toString('base64url');
   const issuedAt = Math.floor(Date.now() / 1000);
-  const payload = `${nonce}.${issuedAt}`;
+  const payload = `${nonce}.${issuedAt}.${kind}`;
   return `${payload}.${computeMac(payload, secret)}`;
 }
 
+/**
+ * Returns the id's kind and issue time when its signature checks out, it is
+ * younger than MAX_AGE_SEC and it has use budget left (counting this use),
+ * or null otherwise.
+ */
 export function verifyAndConsumeLoginRequestId(
   id: string,
   secret: string,
-): boolean {
-  const parts = id.split('.');
-  if (parts.length !== 3) return false;
-  const [nonce, issuedAtRaw, mac] = parts;
+): LoginRequest | null {
+  const match = LOGIN_REQUEST_ID_PATTERN.exec(id);
+  if (!match) return null;
+  const [, nonce, issuedAtRaw, kind, mac] = match;
 
-  const issuedAt = Number(issuedAtRaw);
-  if (!Number.isInteger(issuedAt)) return false;
-
-  const payload = `${nonce}.${issuedAtRaw}`;
+  const payload = `${nonce}.${issuedAtRaw}.${kind}`;
   const provided = Buffer.from(mac, 'hex');
   const expected = Buffer.from(computeMac(payload, secret), 'hex');
   if (
     provided.length !== expected.length ||
     !timingSafeEqual(provided, expected)
   ) {
-    return false;
+    return null;
   }
 
+  const issuedAt = Number(issuedAtRaw);
   const ageSec = Math.floor(Date.now() / 1000) - issuedAt;
-  if (ageSec < 0 || ageSec > MAX_AGE_SEC) return false;
+  if (ageSec < 0 || ageSec > MAX_AGE_SEC) return null;
 
-  const entry = useCounts.get(id) ?? {count: 0, issuedAt};
-  if (entry.count >= MAX_USES) return false;
+  const entry = useCounts.get(nonce) ?? {count: 0, issuedAt};
+  if (entry.count >= MAX_USES) return null;
   entry.count += 1;
-  useCounts.set(id, entry);
+  useCounts.set(nonce, entry);
 
-  return true;
+  return {kind: kind as LoginRequestKind, issuedAt};
 }
