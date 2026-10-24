@@ -1,6 +1,6 @@
 {
   "name": "@fortmesa/yarn-plugin-oidc-login",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "private": true,
   "description": "Yarn Berry plugin: automatically drives verdaccio-generic-oidc's npm web-login handshake when a request has no token or gets a stale-token 401, instead of yarn just failing.",
   "license": "MIT",
